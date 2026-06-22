@@ -56,6 +56,28 @@ class SourceGenerator : public Visitor {
     std::string GetIndentation() { return std::string(this->dwIndentationLevel * kIndentationSpaceCount, ' '); } // NOLINT(*-return-braced-init-list)
 
     void NextLine() { buffer << "\n"; }
+
+    bool bEmitSemicolons = false;
+    bool bEmitCallLineInfo = false;
+    bool bEmitDebugInfo = false;
+    void EndStatement(ASTNode *node = nullptr, bool isCall = false) {
+        if (this->bEmitSemicolons)
+            buffer << ";";
+        if (node && node->debugLine >= 0) {
+            if (this->bEmitDebugInfo) {
+                buffer << " --[[ Line: " << node->debugLine;
+                if (node->debugReg >= 0)
+                    buffer << ", Register: R" << node->debugReg;
+                if (!node->debugOpCode.empty())
+                    buffer << ", OpCode: " << node->debugOpCode;
+                buffer << " ]]";
+            } else if (this->bEmitCallLineInfo && isCall) {
+                buffer << " --[[ Line: " << node->debugLine << " ]]";
+            }
+        }
+        this->NextLine();
+    }
+
     void IncreaseIndentation() { this->dwIndentationLevel++; }
     void DecreaseIndentation() {
         ASSERT(this->dwIndentationLevel - 1 >= 0, "indentation out of range. Overpopped");
@@ -146,7 +168,7 @@ class SourceGenerator : public Visitor {
         lpNode->lpFunctionBody->Accept(this);
         this->DecreaseIndentation();
         buffer << this->GetIndentation() << "end";
-        this->NextLine();
+        this->EndStatement();
     }
 
     // drops informational comments only; warnings still emitted.
@@ -179,7 +201,7 @@ class SourceGenerator : public Visitor {
         if (*text.rbegin() != '\n')
             this->NextLine();
 
-        buffer << indent << "]]";
+        buffer << indent << "]]\n";
 
         if (lpNode->bNewLine)
             this->NextLine();
@@ -220,7 +242,7 @@ class SourceGenerator : public Visitor {
             }
 
             buffer << ")";
-            this->NextLine();
+            this->EndStatement(lpNode, true);
         } else {
             lpNode->callee->Accept(this);
             buffer << "(";
@@ -305,7 +327,7 @@ class SourceGenerator : public Visitor {
                     buffer << ", ";
             }
         }
-        this->NextLine();
+        this->EndStatement(lpNode);
     }
 
     void Visit(ExpressionStatementNode *lpNode) override {
@@ -316,17 +338,32 @@ class SourceGenerator : public Visitor {
     void Visit(BreakStatementNode *lpNode) override {
         (void)lpNode;
         buffer << this->GetIndentation() << "break";
-        this->NextLine();
+        this->EndStatement();
     }
 
     void Visit(ContinueStatementNode *lpNode) override {
         (void)lpNode;
         buffer << this->GetIndentation() << "continue";
-        this->NextLine();
+        this->EndStatement();
     }
 
     void Visit(BlockStatementNode *lpNode) override {
         (void)lpNode;
+        // A reconstructed lexical scope renders as a `do ... end` block; a plain block
+        // (if/else and loop bodies) is a transparent container that just emits its children.
+        if (lpNode->bIsScopeBlock) {
+            if (lpNode->body.empty())
+                return; // a reconstructed scope emptied by later passes (e.g. dead-local elimination) is dropped.
+            buffer << this->GetIndentation() << "do";
+            this->NextLine();
+            this->IncreaseIndentation();
+            for (const auto &node : lpNode->body)
+                node->Accept(this);
+            this->DecreaseIndentation();
+            buffer << this->GetIndentation() << "end";
+            this->EndStatement();
+            return;
+        }
         for (const auto &node : lpNode->body) {
             node->Accept(this);
         }
@@ -342,7 +379,7 @@ class SourceGenerator : public Visitor {
         lpNode->body->Accept(this);
         this->DecreaseIndentation();
         buffer << this->GetIndentation() << "end";
-        this->NextLine();
+        this->EndStatement();
     }
 
     void Visit(IfStatementNode *lpNode) override {
@@ -364,7 +401,7 @@ class SourceGenerator : public Visitor {
             lpNode->elseBranch->Accept(this);
             this->DecreaseIndentation();
             buffer << this->GetIndentation() << "end";
-            this->NextLine();
+            this->EndStatement();
             return;
         }
 
@@ -403,7 +440,7 @@ class SourceGenerator : public Visitor {
         }
 
         buffer << this->GetIndentation() << "end";
-        this->NextLine();
+        this->EndStatement();
     }
 
     void Visit(AssignmentStatementNode *lpNode) override {
@@ -413,7 +450,7 @@ class SourceGenerator : public Visitor {
         EmitWithPrecedence(0, lpNode->left.get());
         buffer << " = ";
         EmitWithPrecedence(0, lpNode->right.get());
-        this->NextLine();
+        this->EndStatement(lpNode);
     }
 
     void Visit(BinaryExpressionNode *lpNode) override {
@@ -526,7 +563,7 @@ class SourceGenerator : public Visitor {
             buffer << " = ";
             lpNode->value->Accept(this);
         }
-        this->NextLine();
+        this->EndStatement(lpNode);
     }
     void Visit(NilLiteralNode *lpNode) override {
         (void)lpNode;
@@ -582,7 +619,7 @@ class SourceGenerator : public Visitor {
             buffer << ")";
 
             if (!lpNode->inlineCall)
-                this->NextLine();
+                this->EndStatement(lpNode, true);
             return;
         }
         buffer << this->GetIndentation();
@@ -611,7 +648,7 @@ class SourceGenerator : public Visitor {
         buffer << ")";
 
         if (!lpNode->inlineCall)
-            this->NextLine();
+            this->EndStatement(lpNode, true);
     }
 
     void Visit(ForNumericNode *lpNode) override {
@@ -632,7 +669,7 @@ class SourceGenerator : public Visitor {
         this->DecreaseIndentation();
         buffer << this->GetIndentation();
         buffer << "end";
-        this->NextLine();
+        this->EndStatement();
     }
 
     void Visit(ForGeneralNode *lpNode) override {
@@ -659,7 +696,7 @@ class SourceGenerator : public Visitor {
             lpNode->body->Accept(this);
         this->DecreaseIndentation();
         buffer << this->GetIndentation() << "end";
-        this->NextLine();
+        this->EndStatement();
     }
 
     void Visit(CompoundBinaryExpressionNode *lpNode) override {
@@ -668,7 +705,7 @@ class SourceGenerator : public Visitor {
         lpNode->left->Accept(this);
         buffer << " " << lpNode->op << "= ";
         lpNode->right->Accept(this);
-        this->NextLine();
+        this->EndStatement(lpNode);
     }
 
     void Visit(RepeatStatementNode *lpNode) override {
@@ -682,7 +719,7 @@ class SourceGenerator : public Visitor {
         buffer << this->GetIndentation() << "until (";
         lpNode->condition->Accept(this);
         buffer << ")";
-        this->NextLine();
+        this->EndStatement();
     }
 
     void Visit(VarArgExpression *lpNode) override {

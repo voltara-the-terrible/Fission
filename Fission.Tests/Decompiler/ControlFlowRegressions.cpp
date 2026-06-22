@@ -1165,14 +1165,16 @@ TEST_CASE("Regress: nested REF upvalue capture aliases instead of redefining", "
     INFO("decompile:\n" << out);
     // No by-value capture copy (`local uv_N = ...`) — that would desync the writes.
     CHECK_FALSE(ContainsRegex(out, std::regex(R"(local\s+uv_\d+\s*=)")));
-    // The shared variable is declared once, BEFORE the closure that captures it.
+    // The shared variable is declared once, BEFORE the closure that captures it. With debug
+    // names off, the field-naming heuristic names it after the read field (`globalValue`),
+    // and that name must stay consistent across the by-ref captures and reassignments.
     std::smatch valueDecl;
-    REQUIRE(std::regex_search(out, valueDecl, std::regex(R"(local\s+v\d+\s*=\s*_G\.globalValue)")));
+    REQUIRE(std::regex_search(out, valueDecl, std::regex(R"(local\s+globalValue\s*=\s*_G\.globalValue)")));
     const size_t closurePos = out.find("local function f");
     REQUIRE(closurePos != std::string::npos);
     CHECK(static_cast<size_t>(valueDecl.position(0)) < closurePos);
     // Exactly one declaration of it — the trailing write is an assignment, not a 2nd local.
-    CHECK(CountOccurrences(out, "local v") == 1);
+    CHECK(CountOccurrences(out, "local globalValue") == 1);
 }
 
 // A LUA_TINTEGER constant only reaches the bytecode via a library-member-constant
@@ -1470,4 +1472,133 @@ TEST_CASE("Regress: dead `local` from an or-step is eliminated, the for survives
     CHECK(Contains(out, "table.insert"));
     // the length expression appears once (the for-step), not also as a dead local.
     CHECK(CountOccurrences(out, "#\"67\"") == 1);
+}
+
+// -------------------------------------------------------------------------
+// Nil-guard field read names the local after the field
+// -------------------------------------------------------------------------
+// `local v = t and t.Field` lowers to a phi merge (`v = t; if v then v = t.Field end`),
+// so the field-read arm is a phi consumer, not a fresh local. The naming heuristic used
+// to skip it, leaving a generic `vN`. The whole register should be named after the field,
+// and *every* later read of that register must pick up the new name (no `v3`/`CameraSubject`
+// desync), since it is a single phi-merged register.
+TEST_CASE("Regress: nil-guarded field read names the local after the field", "[Decompiler][Naming][Regression]") {
+    const auto out = DecompileOrFail(R"(
+        return function(self)
+            local cam = workspace.CurrentCamera
+            local subject = cam and cam.CameraSubject
+            if not subject then
+                return self.fallback
+            end
+            if subject:IsA("Humanoid") then
+                return subject.CameraOffset
+            end
+            return subject.CFrame
+        end
+    )", 2);
+
+    INFO("decompile:\n" << out);
+    // The folded short-circuit is named after the field it guards.
+    CHECK(ContainsRegex(out, std::regex(R"(local\s+CameraSubject\s*=\s*\w+\s+and\s+\w+\.CameraSubject)")));
+    // Every later use of the register adopts the name — no leftover generic temp.
+    CHECK(Contains(out, "CameraSubject:IsA"));
+    CHECK(Contains(out, "CameraSubject.CameraOffset"));
+    CHECK(Contains(out, "CameraSubject.CFrame"));
+}
+
+// -------------------------------------------------------------------------
+// do ... end scope reconstruction (register-reuse heuristic)
+// -------------------------------------------------------------------------
+// Two consecutive `do ... end` blocks each declare a local that the Luau register
+// allocator places in the *same* freed slot (the second block reuses the first
+// block's register). That reuse — in straight-line code — is the signature of a
+// closed lexical scope, and ReconstructScopes turns it back into `do ... end`.
+TEST_CASE("Scopes: consecutive do-end blocks recovered from register reuse", "[Decompiler][Scope]") {
+    const auto out = DecompileOrFail(R"(
+        local x = 10
+        do
+            local a = x + 1
+            print(a)
+        end
+        do
+            local b = x + 2
+            print(b)
+        end
+        print(x)
+    )");
+
+    INFO("decompile:\n" << out);
+    // Both scopes are rendered as `do ... end` (two `do` openers, no loops here).
+    CHECK(CountOccurrences(out, "do") == 2);
+    CHECK(CountOccurrences(out, "end") == 2);
+    // Never an empty block.
+    CHECK_FALSE(Contains(out, "do end"));
+    // The block-local uses survive inside their scopes.
+    CHECK(Contains(out, "print(a)"));
+    CHECK(Contains(out, "print(b)"));
+    // The trailing enclosing use of x is NOT pulled into the second block.
+    CHECK(Contains(out, "print(x)"));
+}
+
+// A do-block whose body contains control flow (a for-loop) and a `local function`
+// must still be recovered: the second block's local function reuses the first's
+// freed register. This is the shape that motivated the feature.
+TEST_CASE("Scopes: do-end with local function and loop recovered", "[Decompiler][Scope]") {
+    const auto out = DecompileOrFail(R"(
+        local v0 = 5
+        do
+            local function add(n) return n + 82 end
+            for i = 1, 3 do v0 = add(v0) end
+        end
+        do
+            local function sub(n) return n - 33 end
+            for i = 1, 3 do v0 = sub(v0) end
+        end
+        print(v0)
+    )");
+
+    INFO("decompile:\n" << out);
+    CHECK_FALSE(Contains(out, "do end"));
+    // A bare `do` scope opener (not a `for ... do`) immediately wrapping each local function.
+    CHECK(ContainsRegex(out, std::regex(R"(do\s+local function add)")));
+    CHECK(ContainsRegex(out, std::regex(R"(do\s+local function sub)")));
+    // Both loops survive inside their scopes.
+    CHECK(ContainsRegex(out, std::regex(R"(for [\w ]+=.*\bdo\b)")));
+}
+
+// A single straight-line sequence of locals that all stay live has no register
+// reuse, so it must NOT be wrapped in a spurious `do ... end`.
+TEST_CASE("Scopes: straight-line locals are not wrapped in a do-end", "[Decompiler][Scope]") {
+    const auto out = DecompileOrFail(R"(
+        local a = 1
+        local b = 2
+        local c = 3
+        return a + b + c
+    )");
+
+    INFO("decompile:\n" << out);
+    CHECK_FALSE(Contains(out, "do"));
+}
+
+// A statement sitting between two recovered scopes stays at the enclosing level — it is NOT
+// pulled into the following do-block. Register reuse can't tell an inter-scope statement from a
+// block's leading statement, so the reconstructor keeps such statements where they lie.
+TEST_CASE("Scopes: statements between scopes stay at the enclosing level", "[Decompiler][Scope]") {
+    const auto out = DecompileOrFail(R"(
+        local v0 = 5
+        do
+            local function add(n) return n + 82 end
+            for i = 1, 3 do v0 = add(v0) end
+        end
+        foo()
+        do
+            local function sub(n) return n - 33 end
+            for i = 1, 3 do v0 = sub(v0) end
+        end
+        return v0
+    )");
+
+    INFO("decompile:\n" << out);
+    // foo() stays between the two blocks at column 0 (enclosing), not indented inside the second.
+    CHECK(ContainsRegex(out, std::regex(R"(\nfoo\()")));
 }

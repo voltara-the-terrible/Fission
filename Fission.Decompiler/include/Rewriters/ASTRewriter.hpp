@@ -28,6 +28,9 @@ class ASTRewriter {
                     RewriteBlock(ifS->thenBranch->body);
                 if (ifS->elseBranch)
                     RewriteBlock(ifS->elseBranch->body);
+            } else if (auto blk = std::dynamic_pointer_cast<BlockStatementNode>(stmt)) {
+                // reconstructed `do ... end` scope: descend so folds/cleanups run inside it.
+                RewriteBlock(blk->body);
             } else if (auto fn = std::dynamic_pointer_cast<FunctionDeclarationNode>(stmt); fn && fn->lpFunctionBody) {
                 RewriteBlock(fn->lpFunctionBody->body);
             } else if (auto w = std::dynamic_pointer_cast<WhileStatementNode>(stmt); w && w->body) {

@@ -68,6 +68,13 @@ class ASTNode {
   public:
     virtual ~ASTNode() = default;
     ASTNodeKind nodeKind = ASTNodeKind::Unknown;
+    int32_t debugLine = -1;
+    int32_t debugReg = -1;
+    // Index of the bytecode instruction that produced this node (its PC), or -1.
+    // Stamped alongside debugReg in LiftBlockInstructions; the scope reconstructor
+    // uses it to bound register lifetimes when recovering `do ... end` blocks.
+    int32_t debugPC = -1;
+    std::string debugOpCode;
     virtual void Accept(Visitor *visitor) { (void)visitor; }
 };
 
@@ -103,6 +110,9 @@ class Identifier : public Declaration {
 class BlockStatementNode : public Statement {
   public:
     std::vector<std::shared_ptr<Statement>> body;
+    // When true this block is a standalone lexical scope and renders as `do ... end`.
+    // Default false keeps the transparent-container behaviour used for if/else and loop bodies.
+    bool bIsScopeBlock = false;
     void Accept(Visitor *visitor) override { visitor->Visit(this); }
 };
 

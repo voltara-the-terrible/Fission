@@ -55,9 +55,11 @@ class RobloxTypeInferer : public Visitor {
     std::unordered_map<std::string, std::string> m_renames;
     std::set<std::string> m_names;
     std::set<std::string> m_autoNames;
-    int32_t m_autoNameCounter = 0;
     bool m_inferTypes = true;
     bool m_autoNameVariables = false;
+    // set by an assignment of a closure to a table member (`T.x = function ...`), consumed by the
+    // immediately-following function visit so its first parameter is renamed to `self`.
+    bool m_methodSelfHint = false;
 
     static std::shared_ptr<Expression> MakeTypeAnnotation(const std::string &typeName);
     static std::optional<std::string> IdentifierName(const std::shared_ptr<Expression> &expr);

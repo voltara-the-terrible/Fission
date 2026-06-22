@@ -7,6 +7,8 @@
 #include "AbstractSyntaxTree/Nodes/CommentNode.hpp"
 
 #include <algorithm>
+#include <limits>
+#include <map>
 
 #pragma clang optimize off
 
@@ -592,6 +594,117 @@ static bool IsValidLuauIdent(const std::string &s) {
     return true;
 }
 
+static bool IsLuauKeyword(const std::string &s) {
+    static const std::unordered_set<std::string> kKeywords{"and",   "break", "do",     "else", "elseif", "end",  "false", "for",
+                                                           "function", "if",  "in",     "local", "nil",   "not",  "or",    "repeat",
+                                                           "return",   "then", "true",   "until", "while", "continue"};
+    return kKeywords.contains(s);
+}
+
+// Hand a meaningful name to a register, but only if it is a legal identifier, not a
+// keyword, and not already used by a different register/upvalue in this function (so the
+// heuristic never introduces a shadowing collision). Falls back to the default `vN`/`argN`
+// by simply doing nothing on conflict.
+//
+// Names the whole register (SetGlobalName), not a single SSA version: the default name is
+// register-keyed (`v{reg}`), so a version-keyed name would desync the register's other
+// versions (reassignments, by-ref captures) and the closures that alias them. A register
+// reused for unrelated values shares its name today regardless, so this matches existing
+// behaviour. Skips registers that already carry a non-default name (e.g. parameters).
+static bool TryClaimRegisterName(AnalyzedFunction *fn, int32_t reg, const std::string &candidate) {
+    if (!IsValidLuauIdent(candidate) || IsLuauKeyword(candidate))
+        return false;
+    if (auto it = fn->globalRegNames.find(reg); it != fn->globalRegNames.end() && it->second != std::format("v{}", reg))
+        return false; // already meaningfully named (parameter / earlier heuristic)
+    for (const auto &[r, n] : fn->globalRegNames)
+        if (n == candidate && r != reg)
+            return false;
+    for (const auto &[ref, n] : fn->variableNames)
+        if (n == candidate && ref.regIndex != reg)
+            return false;
+    for (const auto &[ref, n] : fn->ssaOverrides)
+        if (n == candidate && ref.regIndex != reg)
+            return false;
+    for (const auto &[idx, n] : fn->upvalueNames)
+        if (n == candidate)
+            return false;
+    for (const auto &[idx, n] : fn->upvalueNameOverrides)
+        if (n == candidate)
+            return false;
+    fn->SetGlobalName(reg, candidate);
+    return true;
+}
+
+// True when `closureInst`'s result is stored into a table that is used as a class — i.e. a
+// table that somewhere gets `<tbl>.__index = ...`. That makes the closure a method, so its
+// first parameter is the implicit `self`. The `__index` store itself is not a method.
+static bool IsClosureStoredAsMethod(AnalyzedFunction *fn, const LiftedInstruction &closureInst) {
+    const auto &instrs = fn->lpLiftedFunction->instructions;
+    const auto &constants = fn->lpLiftedFunction->lpDeserialized->constants;
+
+    const auto keyIs = [&](const LiftedInstruction &in, const char *want) {
+        if (in.operands.size() < 3 || in.operands[2].type != LiftedOperandType::ImmediateConstant)
+            return false;
+        const auto &k = constants[in.operands[2].value.imm.k];
+        return k.kType == LUA_TSTRING && std::get<std::string>(k.constantData) == want;
+    };
+
+    std::unordered_set<int32_t> classRegs;
+    for (const auto &in : instrs)
+        if (in.operation == LiftedOperation::SETTABLEKS && in.operands.size() >= 2 && in.operands[1].type == LiftedOperandType::Register && keyIs(in, "__index"))
+            classRegs.insert(in.operands[1].value.reg);
+    if (classRegs.empty())
+        return false;
+
+    for (const auto &in : instrs) {
+        if (in.operation != LiftedOperation::SETTABLEKS || in.operands.size() < 3)
+            continue;
+        if (in.operands[1].type != LiftedOperandType::Register || !classRegs.contains(in.operands[1].value.reg))
+            continue;
+        if (keyIs(in, "__index"))
+            continue; // the metatable wiring, not a method
+        if (fn->GetDefinition(in.operands[0]) == &closureInst)
+            return true;
+    }
+    return false;
+}
+
+// True when the function reads/calls through its first parameter as a table (`arg0.x`,
+// `arg0:m()`, `arg0[k]`), the tell-tale of an OOP `self`.
+static bool FirstArgUsedAsTable(AnalyzedFunction *child) {
+    if (child->lpLiftedFunction->lpDeserialized->numparams < 1)
+        return false;
+    for (const auto &in : child->lpLiftedFunction->instructions) {
+        switch (in.operation) {
+        case LiftedOperation::GETTABLE:
+        case LiftedOperation::GETTABLEKS:
+        case LiftedOperation::GETTABLEN:
+        case LiftedOperation::SETTABLE:
+        case LiftedOperation::SETTABLEKS:
+        case LiftedOperation::SETTABLEN:
+        case LiftedOperation::NAMECALL:
+            if (in.operands.size() >= 2 && in.operands[1].type == LiftedOperandType::Register && in.operands[1].value.reg == 0)
+                return true;
+            break;
+        default:
+            break;
+        }
+    }
+    return false;
+}
+
+// Force a method's first parameter to render as `self` (and survive the sub-lift's
+// PopulateNames). Respects an existing meaningful name and avoids a `self` collision.
+static bool TryForceSelfName(AnalyzedFunction *child) {
+    if (auto it = child->globalRegNames.find(0); it != child->globalRegNames.end() && it->second != "v0" && it->second != "arg0")
+        return false; // already has a real name (e.g. debug info)
+    for (const auto &[r, n] : child->globalRegNames)
+        if (n == "self" && r != 0)
+            return false;
+    child->SetGlobalNameOverride(0, "self");
+    return true;
+}
+
 // single-use closure whose use is a table-field store value (`t.field = <closure>`).
 // inline into the store instead of leaking a global like `anon_43_0 = function()...`.
 static bool IsSingleUseTableFieldValue(AnalyzedFunction *func, int32_t reg, int32_t ssaVersion) {
@@ -646,7 +759,42 @@ std::shared_ptr<Expression> ASTLifter::InvertCondition(const std::shared_ptr<Exp
 
 ASTLifter::ASTLifter() {}
 
-ASTFunction ASTLifter::Lift(AnalyzedFunction &analyzedFunction) {
+struct Globals { std::set<std::string> reads; std::set<std::string> writes; };
+Globals GetGlobals(AnalyzedFunction &analyzedFunction) {
+    Globals globals;
+    const auto &constants = analyzedFunction.lpLiftedFunction->lpDeserialized->constants;
+
+    for (const auto &inst : analyzedFunction.lpLiftedFunction->instructions) {
+        if (inst.operation == LiftedOperation::GETGLOBAL) {
+            const auto &k = constants[inst.operands[1].value.imm.k];
+            if (k.kType == LUA_TSTRING)
+                globals.reads.insert(std::get<std::string>(k.constantData));
+        } else if (inst.operation == LiftedOperation::SETGLOBAL) {
+            const auto &k = constants[inst.operands[1].value.imm.k];
+            if (k.kType == LUA_TSTRING)
+                globals.writes.insert(std::get<std::string>(k.constantData));
+        } else if (inst.operation == LiftedOperation::GETIMPORT) {
+            uint32_t importData = inst.operands[2].value.imm.u;
+            int count = importData >> 30;
+            if (count < 1) continue;
+            int id0 = int(importData >> 20) & 1023;
+            const auto &k = constants.at(id0);
+            if (k.kType == LUA_TSTRING)
+                globals.reads.insert(std::get<std::string>(k.constantData));
+        };
+    };
+
+    for (const auto &k : constants)
+        if (k.kType == LUA_TVECTOR) {
+            globals.reads.insert("Vector3");
+            break;
+        };
+
+    return globals;
+};
+
+ASTFunction ASTLifter::Lift(AnalyzedFunction &analyzedFunction, DecompilerFlags flags) {
+    this->m_flags = flags;
     this->m_currentFunction = &analyzedFunction;
     this->m_definedRegisters.clear();
     this->m_pinnedRegisters.clear();
@@ -762,26 +910,151 @@ ASTFunction ASTLifter::Lift(AnalyzedFunction &analyzedFunction) {
 
         std::set<uint32_t> visited;
         ast.statements = LiftControlFlow(0, -1, visited);
+
+        // Recover `do ... end` scopes from register reuse before the info-comment banner is
+        // prepended. Lift() runs once per function (closures are sub-lifted), so m_currentFunction
+        // here is exactly the function owning these statements — its register lifetimes apply.
+        ReconstructScopes(ast.statements, -1);
+
         std::string ttinfo = "Unavailable";
 
         if (analyzedFunction.lpLiftedFunction->lpDeserialized->typeinfo.size() != 0) {
             ttinfo = "Available";
         }
 
-        auto s = std::format(
-            R"(
-    Fission ~~ Function Information:
-        ~ Upvalue Count: {}
-        ~ Argument Count: {}
-        ~ Debug Name: {}
-        ~ Bytecode ID: {}
-        ~ Registers Used: R0-R{}
-        ~ Type Information: {}
-)",
-            analyzedFunction.lpLiftedFunction->lpDeserialized->nups, analyzedFunction.lpLiftedFunction->lpDeserialized->numparams,
-            analyzedFunction.lpLiftedFunction->lpDeserialized->debugName.value_or("anon/no name"),
-            analyzedFunction.lpLiftedFunction->lpDeserialized->bytecodeId, analyzedFunction.lpLiftedFunction->lpDeserialized->maxstacksize - 1, ttinfo
-        );
+        std::string s = "";
+        s = "\n    Fission ~~ Function Information:\n";
+
+        if ((m_flags & DecompilerFlags::DebugInfo) == DecompilerFlags::DebugInfo) {
+            s += std::format(
+                "        ~ Argument Count: {}\n"
+                "        ~ Debug Name: {}\n"
+                "        ~ Bytecode ID: {}\n"
+                "        ~ Registers Used: R0-R{}\n"
+                "        ~ Type Information: {}\n",
+                analyzedFunction.lpLiftedFunction->lpDeserialized->numparams,
+                analyzedFunction.lpLiftedFunction->lpDeserialized->debugName.value_or("anon/no name"),
+                analyzedFunction.lpLiftedFunction->lpDeserialized->bytecodeId,
+                analyzedFunction.lpLiftedFunction->lpDeserialized->maxstacksize - 1,
+                ttinfo
+            );
+        };
+
+        if ((m_flags & DecompilerFlags::FunctionInfo) == DecompilerFlags::FunctionInfo) {
+            s += std::format(
+                "        ~ Name: {}\n"
+                "        ~ Line: {}\n",
+                analyzedFunction.lpLiftedFunction->lpDeserialized->debugName.value_or("unknown"),
+                analyzedFunction.lpLiftedFunction->lpDeserialized->lineDefined
+            );
+        };
+
+        if ((m_flags & DecompilerFlags::Upvalues) == DecompilerFlags::Upvalues) {
+            const int32_t nups = analyzedFunction.lpLiftedFunction->lpDeserialized->nups;
+            if (nups > 0) {
+                if ((m_flags & DecompilerFlags::MinifyUpvalues) == DecompilerFlags::MinifyUpvalues) {
+                    std::string out;
+                    for (int32_t i = 0; i < nups; ++i) {
+                        if (i > 0) out += ", ";
+                        out += std::format("[{}]: {}", i + 1, analyzedFunction.GetUpvalueName(i));
+                    };
+                    s += std::format("        ~ Upvalues: {}\n", out);
+                } else {
+                    s += "        ~ Upvalues: {\n";
+                    for (int32_t i = 0; i < nups; ++i)
+                        s += std::format("            [{}] = {}\n", i + 1, analyzedFunction.GetUpvalueName(i));
+                    s += "        };\n";
+                };
+            };
+        };
+
+        if ((m_flags & DecompilerFlags::Constants) == DecompilerFlags::Constants) {
+            const auto &consts = analyzedFunction.lpLiftedFunction->lpDeserialized->constants;
+            if (!consts.empty()) {
+                auto getStr = [&](const auto &k) -> std::string {
+                    switch (k.kType) {
+                        case LUA_TNIL: return "nil";
+                        case LUA_TBOOLEAN: return std::get<bool>(k.constantData) ? "true" : "false";
+                        case LUA_TNUMBER: return std::format("{}", std::get<double>(k.constantData));
+                        case LUA_TINTEGER: return std::format("{}", std::get<int64_t>(k.constantData));
+                        case LUA_TSTRING: return std::format("\"{}\"", std::get<std::string>(k.constantData));
+                        case LUA_TVECTOR: {
+                            const auto &[x, y, z, w] = std::get<LuauVector>(k.constantData);
+                            return std::format("Vector3.new({}, {}, {})", x, y, z);
+                        }
+                        case LUA_TTABLE: return "{ [any]: any }";
+                        default: return "unknown";
+                    };
+                };
+
+                if ((m_flags & DecompilerFlags::MinifyConstants) == DecompilerFlags::MinifyConstants) {
+                    std::string out;
+                    for (size_t i = 0; i < consts.size(); ++i) {
+                        if (i > 0) out += ", ";
+                        out += std::format("[{}]: {}", i + 1, getStr(consts[i]));
+                    };
+                    s += std::format("        ~ Constants: {}\n", out);
+                } else {
+                    s += "        ~ Constants: {\n";
+                    for (size_t i = 0; i < consts.size(); ++i)
+                        s += std::format("            [{}] = {}\n", i + 1, getStr(consts[i]));
+                    s += "        };\n";
+                };
+            };
+        };
+
+        if ((m_flags & DecompilerFlags::Globals) == DecompilerFlags::Globals) {
+            const auto globals = GetGlobals(analyzedFunction);
+            if (!globals.reads.empty() || !globals.writes.empty()) {
+                if ((m_flags & DecompilerFlags::MinifyGlobals) == DecompilerFlags::MinifyGlobals) {
+                    std::string out;
+                    bool first = true;
+
+                    for (const auto& name : globals.reads) {
+                        if (!first) out += ", ";
+                        out += std::format("[read]: {}", name);
+                        first = false;
+                    };
+
+                    for (const auto& name : globals.writes) {
+                        if (!first) out += ", ";
+                        out += std::format("[write]: {}", name);
+                        first = false;
+                    };
+
+                    s += std::format("        ~ Globals: {}\n", out);
+                } else {
+                    s += "        ~ Globals: {\n";
+
+                    for (const auto& name : globals.reads)
+                        s += std::format("            [read] = {}\n", name);
+
+                    for (const auto& name : globals.writes)
+                        s += std::format("            [write] = {}\n", name);
+
+                    s += "        };\n";
+                };
+            };
+        };
+
+        if ((m_flags & DecompilerFlags::Protos) == DecompilerFlags::Protos) {
+            const auto &protos = analyzedFunction.lpLiftedFunction->lpDeserialized->subfunctions;
+            if (!protos.empty()) {
+                if ((m_flags & DecompilerFlags::MinifyProtos) == DecompilerFlags::MinifyProtos) {
+                    std::string out;
+                    for (size_t i = 0; i < protos.size(); ++i) {
+                        if (i > 0) out += ", ";
+                        out += std::format("[{}]: {}", i + 1, std::format("(\"{}\" | {})", protos[i]->debugName.value_or("unknown"), protos[i]->lineDefined));
+                    };
+                    s += std::format("        ~ Protos: {}\n", out);
+                } else {
+                    s += "        ~ Protos: {\n";
+                    for (size_t i = 0; i < protos.size(); ++i)
+                        s += std::format("            [{}] = {}\n", i + 1, std::format("(\"{}\" | {})", protos[i]->debugName.value_or("unknown"), protos[i]->lineDefined));
+                    s += "        };\n";
+                };
+            };
+        };
 
         if (analyzedFunction.lpLiftedFunction->lpDeserialized->bIsMain) {
             s = std::format(
@@ -807,7 +1080,7 @@ ASTFunction ASTLifter::Lift(AnalyzedFunction &analyzedFunction) {
 
     for (auto &subFunc : analyzedFunction.innerFunctions) {
         ASTLifter subLifter;
-        ast.subFunctions.push_back(subLifter.Lift(subFunc));
+        ast.subFunctions.push_back(subLifter.Lift(subFunc, this->m_flags));
     }
 
     return ast;
@@ -1100,6 +1373,26 @@ std::vector<std::shared_ptr<Statement>> ASTLifter::LiftControlFlow(uint32_t curr
                 if (ifStmt->thenBranch->body.empty() && ifStmt->elseBranch) {
                     std::swap(ifStmt->thenBranch, ifStmt->elseBranch);
                     ifStmt->condition = InvertCondition(trueCond);
+                }
+            }
+
+            // A register FIRST written inside a branch produced a `local` confined to that branch's
+            // scope. m_definedRegisters is flat (no scope stack), so leaving such a reg marked "defined"
+            // makes a later OUTER write to it emit a bare assignment that silently targets a global
+            // (e.g. `v6` reused after the if). Drop those branch-scoped definitions — but keep any
+            // register whose value escapes via a merge phi (HoistPhiLocals lifts those to one outer
+            // `local`; dropping them would make a nested if/elseif chain re-hoist and shadow).
+            {
+                std::unordered_set<int32_t> escaping;
+                if (mergeIdx != static_cast<uint32_t>(-1) && mergeIdx < m_currentFunction->basicBlocks.size())
+                    for (const auto &phi : m_currentFunction->basicBlocks[mergeIdx].phiNodes)
+                        if (!phi.operands.empty() && phi.operands[0].type == LiftedOperandType::Register)
+                            escaping.insert(phi.operands[0].value.reg);
+                for (auto it = m_definedRegisters.begin(); it != m_definedRegisters.end();) {
+                    if (!definedBeforeBranches.contains(*it) && !escaping.contains(*it))
+                        it = m_definedRegisters.erase(it);
+                    else
+                        ++it;
                 }
             }
 
@@ -1581,6 +1874,10 @@ std::vector<std::shared_ptr<Statement>> ASTLifter::LiftBlockInstructions(const B
         if (!forceDefinitions && ShouldInline(&inst))
             continue;
 
+        // Statements emitted for this instruction get the instruction's line/register/opcode stamped
+        // below, so the source generator can render the `--[[ Line/Register/OpCode ]]` annotations.
+        const size_t dbgStmtStart = statements.size();
+
         switch (inst.operation) {
         case LiftedOperation::GETVARARGS: {
             break; // not handled here.
@@ -1670,23 +1967,33 @@ std::vector<std::shared_ptr<Statement>> ASTLifter::LiftBlockInstructions(const B
                                 op.value.reg = inst.operands[0].value.reg + 1 + 1 /* arg1 */;
                                 op.ssaVersion = argVersions[1];
                                 auto expr = LiftExpression(op, true);
-                                if (auto str = std::dynamic_pointer_cast<StringLiteralNode>(expr); str && IsValidLuauIdent(str->value))
+                                // Skip naming a result whose register is reused/merged by a phi (e.g.
+                                // `return x:FindFirstChild(..) or y`, where the call result and the `or`
+                                // result share a register). Naming only one SSA version desyncs it from the
+                                // register's other versions — that breaks the `or`-fold and leaves dangling
+                                // reads of the merged register. Keeping it generic lets FoldTerminalOrChain
+                                // collapse the whole thing to `return A or B`.
+                                if (auto str = std::dynamic_pointer_cast<StringLiteralNode>(expr); str && IsValidLuauIdent(str->value) && !m_phiConsumers.contains(ref))
                                     this->m_currentFunction->SetVariableName(ref.regIndex, ref.version, str->value);
                             }
                         }
                     } else if (auto callNode = std::dynamic_pointer_cast<CallExpressionNode>(callExpr)) {
-                        // `require(path:WaitForChild("Module"))` names the result after the child.
                         auto callee = std::dynamic_pointer_cast<IdentifierExpressionNode>(callNode->callee);
-                        if (callee && callee->identifier && callee->identifier->name == "require" && callNode->arguments.size() == 1) {
+                        const std::string calleeName = (callee && callee->identifier) ? callee->identifier->name : "";
+                        // `require(path:WaitForChild("Module"))` names the result after the child.
+                        if (calleeName == "require" && callNode->arguments.size() == 1) {
                             if (auto argCall = std::dynamic_pointer_cast<NameCallExpressionNode>(callNode->arguments[0])) {
                                 auto m = std::dynamic_pointer_cast<IdentifierExpressionNode>(argCall->callWhat);
                                 const bool childLookup =
                                     m && m->identifier && (m->identifier->name == "WaitForChild" || m->identifier->name == "FindFirstChild");
                                 if (childLookup && argCall->arguments.size() == 1)
-                                    if (auto str = std::dynamic_pointer_cast<StringLiteralNode>(argCall->arguments[0]); str && IsValidLuauIdent(str->value))
+                                    if (auto str = std::dynamic_pointer_cast<StringLiteralNode>(argCall->arguments[0]); str && IsValidLuauIdent(str->value) && !m_phiConsumers.contains(ref))
                                         this->m_currentFunction->SetVariableName(ref.regIndex, ref.version, str->value);
                             }
                         }
+                        // `setmetatable(...)` result is conventionally `self` (the OOP constructor idiom).
+                        else if (calleeName == "setmetatable" && !m_phiConsumers.contains(ref))
+                            TryClaimRegisterName(this->m_currentFunction, ref.regIndex, "self");
                     }
 
                     lhs.push_back(
@@ -1728,6 +2035,11 @@ std::vector<std::shared_ptr<Statement>> ASTLifter::LiftBlockInstructions(const B
                     break;
                 }
             }
+
+            // A closure stored into a class table (`Class.method = function(arg0, ...)`) is a
+            // method; name its first parameter `self`.
+            if (targetFunc && IsClosureStoredAsMethod(m_currentFunction, inst) && FirstArgUsedAsTable(targetFunc))
+                TryForceSelfName(targetFunc);
 
             // walk trailing CAPTUREs; "propagate" = rename the source reg to the upvalue's debug name
             // instead of emitting `local up = source`. needs: debug name + VAL/REF capture + register source.
@@ -1820,7 +2132,7 @@ std::vector<std::shared_ptr<Statement>> ASTLifter::LiftBlockInstructions(const B
             }
 
             ASTLifter subLifter;
-            ASTFunction subAst = subLifter.Lift(*targetFunc);
+            ASTFunction subAst = subLifter.Lift(*targetFunc, this->m_flags);
 
             std::string funcName = this->GetFunctionName(duplicatedFunction);
             // Pin the closure name to *this* SSA version only. Using
@@ -1919,6 +2231,10 @@ std::vector<std::shared_ptr<Statement>> ASTLifter::LiftBlockInstructions(const B
                 }
             }
 
+            // A closure stored into a class table is a method; name its first parameter `self`.
+            if (targetFunc && IsClosureStoredAsMethod(m_currentFunction, inst) && FirstArgUsedAsTable(targetFunc))
+                TryForceSelfName(targetFunc);
+
             // See DUPCLOSURE for the rationale of the propagate-or-emit split.
             struct CaptureAction {
                 LiftedInstruction *capInst;
@@ -2002,7 +2318,7 @@ std::vector<std::shared_ptr<Statement>> ASTLifter::LiftBlockInstructions(const B
             }
 
             ASTLifter subLifter;
-            ASTFunction subAst = subLifter.Lift(*targetFunc);
+            ASTFunction subAst = subLifter.Lift(*targetFunc, this->m_flags);
 
             std::string funcName = this->GetFunctionName(proto);
 
@@ -2134,11 +2450,21 @@ std::vector<std::shared_ptr<Statement>> ASTLifter::LiftBlockInstructions(const B
             const auto *def = m_currentFunction->GetDefinition(inst.operands[0]);
             if (def == &inst) {
                 auto isDefined = m_definedRegisters.contains(inst.operands[0].value.reg);
-                auto target = std::make_shared<IdentifierExpressionNode>(std::make_shared<Identifier>(ResolveVariableName(inst.operands[0])));
                 auto val = LiftExpression(inst.operands[0], true);
 
                 const bool isParameterWrite = inst.operands[0].value.reg < m_currentFunction->lpLiftedFunction->lpDeserialized->numparams;
-                if ((inst.operands[0].ssaVersion <= 1 && !isParameterWrite) || !isDefined)
+                const bool isNewLocal = (inst.operands[0].ssaVersion <= 1 && !isParameterWrite) || !isDefined;
+
+                // Name a fresh `local v = tbl.Key` after the field it reads (e.g. `local Parent = x.Parent`).
+                if (isNewLocal && inst.operation == LiftedOperation::GETTABLEKS &&
+                    !m_phiConsumers.contains({static_cast<uint8_t>(inst.operands[0].value.reg), inst.operands[0].ssaVersion}))
+                    if (auto mem = std::dynamic_pointer_cast<MemberExpressionNode>(val))
+                        if (auto key = std::dynamic_pointer_cast<StringLiteralNode>(mem->key))
+                            TryClaimRegisterName(this->m_currentFunction, inst.operands[0].value.reg, key->value);
+
+                auto target = std::make_shared<IdentifierExpressionNode>(std::make_shared<Identifier>(ResolveVariableName(inst.operands[0])));
+
+                if (isNewLocal)
                     statements.push_back(std::make_shared<VariableDeclarationNode>(target, val));
                 else {
                     if (val->nodeKind == ASTNodeKind::BinaryExpression) {
@@ -2161,8 +2487,350 @@ std::vector<std::shared_ptr<Statement>> ASTLifter::LiftBlockInstructions(const B
             break;
         }
         }
+
+        // Stamp this instruction's debug info onto every statement it produced.
+        const int32_t dbgLine = m_currentFunction->lpLiftedFunction->lpDeserialized->GetInstructionLine(i);
+        const int32_t dbgReg =
+            (!inst.operands.empty() && inst.operands[0].type == LiftedOperandType::Register) ? inst.operands[0].value.reg : -1;
+        const std::string dbgOp{OperationToString(inst.operation)};
+        for (size_t s = dbgStmtStart; s < statements.size(); ++s) {
+            statements[s]->debugLine = dbgLine;
+            statements[s]->debugReg = dbgReg;
+            statements[s]->debugPC = i;
+            statements[s]->debugOpCode = dbgOp;
+            // A call/namecall statement is wrapped in an ExpressionStatementNode, but the generator
+            // renders its `--[[ ... ]]` from the inner call node's EndStatement, so stamp that too.
+            if (auto exprStmt = std::dynamic_pointer_cast<ExpressionStatementNode>(statements[s]); exprStmt && exprStmt->expression) {
+                exprStmt->expression->debugLine = dbgLine;
+                exprStmt->expression->debugReg = dbgReg;
+                // A method call folds NAMECALL+CALL and materialises at the CALL instruction; report it
+                // as NAMECALL so the annotation matches the rendered `a:b()` form.
+                exprStmt->expression->debugOpCode =
+                    std::dynamic_pointer_cast<NameCallExpressionNode>(exprStmt->expression) ? std::string{"NAMECALL"} : dbgOp;
+            }
+        }
     }
     return statements;
+}
+
+// --- helpers for scope reconstruction (name-based liveness, control-flow aware) ---
+
+// Name a statement introduces as a local: `local x = ...` or `local function f`.
+static std::optional<std::string> ScopeLocalDefName(const std::shared_ptr<Statement> &s) {
+    if (auto decl = std::dynamic_pointer_cast<VariableDeclarationNode>(s))
+        return ExtractIdentifierName(decl->identifier);
+    if (auto fn = std::dynamic_pointer_cast<FunctionDeclarationNode>(s); fn && fn->bIsLocalDeclaration && !fn->functionName.empty())
+        return fn->functionName;
+    return std::nullopt;
+}
+
+static bool ScopeStmtMentionsAny(const std::shared_ptr<Statement> &s, const std::unordered_set<std::string> &names);
+
+static bool ScopeExprMentionsAny(const std::shared_ptr<Expression> &e, const std::unordered_set<std::string> &names) {
+    if (!e || names.empty())
+        return false;
+    if (auto id = std::dynamic_pointer_cast<IdentifierExpressionNode>(e))
+        return id->identifier && names.contains(id->identifier->name);
+    if (auto id = std::dynamic_pointer_cast<Identifier>(e))
+        return names.contains(id->name);
+    if (auto bin = std::dynamic_pointer_cast<BinaryExpressionNode>(e))
+        return ScopeExprMentionsAny(bin->left, names) || ScopeExprMentionsAny(bin->right, names);
+    if (auto cbin = std::dynamic_pointer_cast<CompoundBinaryExpressionNode>(e))
+        return ScopeExprMentionsAny(cbin->left, names) || ScopeExprMentionsAny(cbin->right, names);
+    if (auto un = std::dynamic_pointer_cast<UnaryExpressionNode>(e))
+        return ScopeExprMentionsAny(un->operand, names);
+    if (auto idx = std::dynamic_pointer_cast<IndexExpressionNode>(e))
+        return ScopeExprMentionsAny(idx->left, names) || ScopeExprMentionsAny(idx->right, names);
+    if (auto mem = std::dynamic_pointer_cast<MemberExpressionNode>(e))
+        return ScopeExprMentionsAny(mem->table, names) || ScopeExprMentionsAny(mem->key, names);
+    if (auto call = std::dynamic_pointer_cast<CallExpressionNode>(e)) {
+        if (ScopeExprMentionsAny(call->callee, names))
+            return true;
+        for (const auto &a : call->arguments)
+            if (ScopeExprMentionsAny(a, names))
+                return true;
+        return false;
+    }
+    if (auto nc = std::dynamic_pointer_cast<NameCallExpressionNode>(e)) {
+        if (ScopeExprMentionsAny(nc->calledOn, names) || ScopeExprMentionsAny(nc->callWhat, names))
+            return true;
+        for (const auto &a : nc->arguments)
+            if (ScopeExprMentionsAny(a, names))
+                return true;
+        return false;
+    }
+    if (auto tbl = std::dynamic_pointer_cast<TableLiteralNode>(e)) {
+        for (const auto &x : tbl->expressions)
+            if (ScopeExprMentionsAny(x, names))
+                return true;
+        return false;
+    }
+    if (auto fn = std::dynamic_pointer_cast<FunctionDeclarationNode>(e)) {
+        if (fn->lpFunctionBody)
+            for (const auto &st : fn->lpFunctionBody->body)
+                if (ScopeStmtMentionsAny(st, names))
+                    return true; // capture as an upvalue counts as a use
+        return false;
+    }
+    return false;
+}
+
+static bool ScopeStmtMentionsAny(const std::shared_ptr<Statement> &s, const std::unordered_set<std::string> &names) {
+    if (!s || names.empty())
+        return false;
+    if (auto decl = std::dynamic_pointer_cast<VariableDeclarationNode>(s))
+        return ScopeExprMentionsAny(decl->value, names);
+    if (auto asn = std::dynamic_pointer_cast<AssignmentStatementNode>(s))
+        return ScopeExprMentionsAny(asn->left, names) || ScopeExprMentionsAny(asn->right, names);
+    if (auto es = std::dynamic_pointer_cast<ExpressionStatementNode>(s))
+        return ScopeExprMentionsAny(es->expression, names);
+    if (auto ret = std::dynamic_pointer_cast<ReturnStatementNode>(s)) {
+        for (const auto &v : ret->returnValues)
+            if (ScopeExprMentionsAny(v, names))
+                return true;
+        return false;
+    }
+    if (auto iff = std::dynamic_pointer_cast<IfStatementNode>(s)) {
+        if (ScopeExprMentionsAny(iff->condition, names))
+            return true;
+        if (iff->thenBranch)
+            for (const auto &st : iff->thenBranch->body)
+                if (ScopeStmtMentionsAny(st, names))
+                    return true;
+        if (iff->elseBranch)
+            for (const auto &st : iff->elseBranch->body)
+                if (ScopeStmtMentionsAny(st, names))
+                    return true;
+        return false;
+    }
+    if (auto w = std::dynamic_pointer_cast<WhileStatementNode>(s)) {
+        if (ScopeExprMentionsAny(w->condition, names))
+            return true;
+        if (w->body)
+            for (const auto &st : w->body->body)
+                if (ScopeStmtMentionsAny(st, names))
+                    return true;
+        return false;
+    }
+    if (auto rp = std::dynamic_pointer_cast<RepeatStatementNode>(s)) {
+        if (ScopeExprMentionsAny(rp->condition, names))
+            return true;
+        if (rp->body)
+            for (const auto &st : rp->body->body)
+                if (ScopeStmtMentionsAny(st, names))
+                    return true;
+        return false;
+    }
+    if (auto fn = std::dynamic_pointer_cast<ForNumericNode>(s)) {
+        if (ScopeExprMentionsAny(fn->startVariable, names) || ScopeExprMentionsAny(fn->increaseBy, names) || ScopeExprMentionsAny(fn->maxIncreased, names))
+            return true;
+        if (fn->lpLoopBody)
+            for (const auto &st : fn->lpLoopBody->body)
+                if (ScopeStmtMentionsAny(st, names))
+                    return true;
+        return false;
+    }
+    if (auto fg = std::dynamic_pointer_cast<ForGeneralNode>(s)) {
+        if (ScopeExprMentionsAny(fg->generator, names) || ScopeExprMentionsAny(fg->state, names) || ScopeExprMentionsAny(fg->index, names))
+            return true;
+        if (fg->body)
+            for (const auto &st : fg->body->body)
+                if (ScopeStmtMentionsAny(st, names))
+                    return true;
+        return false;
+    }
+    if (auto blk = std::dynamic_pointer_cast<BlockStatementNode>(s)) {
+        for (const auto &st : blk->body)
+            if (ScopeStmtMentionsAny(st, names))
+                return true;
+        return false;
+    }
+    if (auto fd = std::dynamic_pointer_cast<FunctionDeclarationNode>(s)) {
+        if (fd->lpFunctionBody)
+            for (const auto &st : fd->lpFunctionBody->body)
+                if (ScopeStmtMentionsAny(st, names))
+                    return true;
+        return false;
+    }
+    if (auto e = std::dynamic_pointer_cast<Expression>(s))
+        return ScopeExprMentionsAny(e, names);
+    return false;
+}
+
+void ASTLifter::ReconstructScopes(std::vector<std::shared_ptr<Statement>> &stmts, int32_t minBaseReg) {
+    constexpr int32_t kNoReg = std::numeric_limits<int32_t>::max();
+    if (!m_currentFunction || stmts.size() < 2)
+        return;
+
+    const auto &instructions = m_currentFunction->lpLiftedFunction->instructions;
+    const int32_t numParams = m_currentFunction->lpLiftedFunction->lpDeserialized->numparams;
+
+    // (1) For a fresh body (minBaseReg < 0) descend into nested control-flow bodies first: those
+    //     statements belong to the same function, so the same register lifetimes apply. Closure
+    //     bodies are NOT visited — they are a different function, handled by their own Lift().
+    //     A wrapped-body recursion (minBaseReg >= 0) skips this; its loops were already visited.
+    if (minBaseReg < 0) {
+        for (auto &stmt : stmts) {
+            if (auto ifS = std::dynamic_pointer_cast<IfStatementNode>(stmt)) {
+                if (ifS->thenBranch)
+                    ReconstructScopes(ifS->thenBranch->body, -1);
+                if (ifS->elseBranch)
+                    ReconstructScopes(ifS->elseBranch->body, -1);
+            } else if (auto w = std::dynamic_pointer_cast<WhileStatementNode>(stmt); w && w->body) {
+                ReconstructScopes(w->body->body, -1);
+            } else if (auto r = std::dynamic_pointer_cast<RepeatStatementNode>(stmt); r && r->body) {
+                ReconstructScopes(r->body->body, -1);
+            } else if (auto fnum = std::dynamic_pointer_cast<ForNumericNode>(stmt); fnum && fnum->lpLoopBody) {
+                ReconstructScopes(fnum->lpLoopBody->body, -1);
+            } else if (auto fgen = std::dynamic_pointer_cast<ForGeneralNode>(stmt); fgen && fgen->body) {
+                ReconstructScopes(fgen->body->body, -1);
+            }
+        }
+    }
+
+    // a loop/if statement — always part of an enclosing block (it owns registers >= the base).
+    auto isControlFlow = [](const std::shared_ptr<Statement> &s) -> bool {
+        return std::dynamic_pointer_cast<IfStatementNode>(s) || std::dynamic_pointer_cast<WhileStatementNode>(s) ||
+               std::dynamic_pointer_cast<RepeatStatementNode>(s) || std::dynamic_pointer_cast<ForNumericNode>(s) ||
+               std::dynamic_pointer_cast<ForGeneralNode>(s);
+    };
+
+    // Did any instruction strictly between pc1 and pc2 write a register above `reg`? A real closed
+    // scope makes the register window climb above the base while the block runs; an adjacent
+    // dead-store/shadow reuse the optimizer produced does not.
+    auto climbedAbove = [&](int32_t a, int32_t b, int32_t reg) -> bool {
+        const int32_t pc1 = std::min(a, b), pc2 = std::max(a, b);
+        for (int32_t p = pc1 + 1; p < pc2 && p < static_cast<int32_t>(instructions.size()); ++p) {
+            const auto &in = instructions[p];
+            if (!in.operands.empty() && in.operands[0].type == LiftedOperandType::Register && in.operands[0].value.reg > reg)
+                return true;
+        }
+        return false;
+    };
+
+    // (2) collect materialized local definitions (`local x = ...` and `local function f`) at this
+    //     level. A register reused by a second such local — in code the optimizer did not have to
+    //     reuse — is the signature of a closed lexical scope between the two.
+    struct Def {
+        size_t idx;
+        int32_t reg;
+        int32_t pc;
+        std::string name;
+    };
+    std::vector<Def> defs;
+    for (size_t i = 0; i < stmts.size(); ++i) {
+        auto name = ScopeLocalDefName(stmts[i]);
+        if (!name)
+            continue;
+        const int32_t reg = stmts[i]->debugReg;
+        const int32_t pc = stmts[i]->debugPC;
+        if (reg >= numParams && reg > minBaseReg && pc >= 0)
+            defs.push_back({i, reg, pc, *name});
+    }
+    if (defs.size() < 2)
+        return;
+
+    std::map<int32_t, std::vector<size_t>> byReg; // reg -> indices into defs (ascending)
+    for (size_t d = 0; d < defs.size(); ++d)
+        byReg[defs[d].reg].push_back(d);
+
+    int32_t baseReg = kNoReg;
+    for (const auto &[reg, occ] : byReg) {
+        if (occ.size() < 2)
+            continue;
+        for (size_t j = 0; j + 1 < occ.size(); ++j)
+            if (climbedAbove(defs[occ[j]].pc, defs[occ[j + 1]].pc, reg)) {
+                baseReg = std::min(baseReg, reg);
+                break;
+            }
+    }
+    if (baseReg == kNoReg)
+        return;
+
+    // generation openers: each statement index that (re)defines baseReg as a local.
+    std::vector<size_t> genStarts;
+    for (const auto &d : defs)
+        if (d.reg == baseReg)
+            genStarts.push_back(d.idx);
+    std::sort(genStarts.begin(), genStarts.end());
+
+    struct WrapRange {
+        size_t start;
+        size_t end; // exclusive
+        int32_t baseReg;
+    };
+    std::vector<WrapRange> ranges;
+
+    for (size_t g = 0; g < genStarts.size(); ++g) {
+        const size_t startIdx = genStarts[g];
+        const size_t bound = (g + 1 < genStarts.size()) ? genStarts[g + 1] : stmts.size(); // exclusive
+
+        // Extent runs forward from the base local only: absorb consecutive statements that belong to
+        // the scope — another block-local (reg >= base), a loop/if (owns higher registers), or a
+        // plain statement that reads one of the block's locals. Stop at the first statement that is
+        // none of these: it reuses the freed registers as enclosing-scope temporaries. Statements
+        // sitting between two scopes stay at the enclosing level (they are NOT pulled into the next
+        // block) — the register reuse can't distinguish that case, so we keep them where they lie.
+        std::unordered_set<std::string> blockLocals; // names declared inside this scope (base first)
+        size_t endIdx = startIdx + 1;
+        for (size_t i = startIdx; i < bound; ++i) {
+            const auto &s = stmts[i];
+            if (auto name = ScopeLocalDefName(s); name && s->debugReg >= baseReg) {
+                blockLocals.insert(*name);
+                endIdx = i + 1;
+                continue;
+            }
+            if (isControlFlow(s)) {
+                endIdx = i + 1;
+                continue;
+            }
+            if (ScopeStmtMentionsAny(s, blockLocals)) {
+                endIdx = i + 1;
+                continue;
+            }
+            break;
+        }
+
+        if (endIdx - startIdx < 2)
+            continue;
+
+        // Safety: a block-local must not be read after the block (it would fall out of scope).
+        bool escapes = false;
+        for (size_t i = endIdx; i < stmts.size() && !escapes; ++i)
+            escapes = ScopeStmtMentionsAny(stmts[i], blockLocals);
+        if (escapes)
+            continue;
+
+        ranges.push_back({startIdx, endIdx, baseReg});
+    }
+
+    if (ranges.empty())
+        return;
+    std::sort(ranges.begin(), ranges.end(), [](const WrapRange &a, const WrapRange &b) { return a.start < b.start; });
+
+    // (3) rebuild the vector, wrapping each range and recursing into it for deeper nesting.
+    std::vector<std::shared_ptr<Statement>> out;
+    out.reserve(stmts.size());
+    size_t i = 0, r = 0;
+    while (i < stmts.size()) {
+        while (r < ranges.size() && ranges[r].start < i)
+            ++r; // skip any range made stale by a prior wrap (defensive; ranges shouldn't overlap)
+        if (r < ranges.size() && i == ranges[r].start) {
+            auto block = std::make_shared<BlockStatementNode>();
+            block->bIsScopeBlock = true;
+            block->debugReg = ranges[r].baseReg;
+            for (size_t k = ranges[r].start; k < ranges[r].end; ++k)
+                block->body.push_back(stmts[k]);
+            ReconstructScopes(block->body, ranges[r].baseReg); // nest only at strictly higher registers
+            out.push_back(block);
+            i = ranges[r].end;
+            ++r;
+        } else {
+            out.push_back(stmts[i]);
+            ++i;
+        }
+    }
+    stmts = std::move(out);
 }
 
 bool ASTLifter::CanReach(uint32_t start, uint32_t target, uint32_t stopBlock, const std::set<uint32_t> &visitedScopes) {
@@ -2351,6 +3019,17 @@ std::shared_ptr<Expression> ASTLifter::LiftExpression(const LiftedOperand &__ope
         default: return std::make_shared<NilLiteralNode>();
         }
     };
+
+    // SUBRK/DIVRK put the CONSTANT on the LEFT and the register on the RIGHT (`K - R`, `K / R`),
+    // unlike SUBK/DIVK. They are not part of the left-leaning register chain (their left operand is a
+    // constant, not a register), so opSymbol() skips them and the def would be neither inlined nor
+    // emitted, leaving a dangling bare read (e.g. `(zoom + delta) / v5` with v5 never declared).
+    if (def->operation == LiftedOperation::SUBRK || def->operation == LiftedOperation::DIVRK) {
+        auto leftK = resolveKConstant(def->operands[1].value.imm.n);
+        auto right = LiftExpression(def->operands[2]);
+        const char *sym = def->operation == LiftedOperation::SUBRK ? "-" : "/";
+        return std::make_shared<BinaryExpressionNode>(sym, leftK, right);
+    }
 
     if (opSymbol(def->operation) != nullptr) {
         std::vector<std::pair<const char *, std::shared_ptr<Expression>>> rights;
@@ -2958,11 +3637,14 @@ bool ASTLifter::ShouldInline(const LiftedInstruction *inst) {
                     auto users = m_currentFunction->users[{static_cast<uint8_t>(regA), ref.version}];
                     if (users.size() == 1) {
                         auto op = users[0]->operation;
-                        // allow inlining returns, other Calls, and arith ops.
+                        // allow inlining returns, other Calls, arith ops, and store sinks
+                        // (`t.f = obj:m()`, `upval = obj:m()`, `glob = obj:m()`).
                         if (op == LiftedOperation::RETURN || op == LiftedOperation::CALL || op == LiftedOperation::NAMECALL || op == LiftedOperation::ADD ||
                             op == LiftedOperation::SUB || op == LiftedOperation::MUL || op == LiftedOperation::DIV || op == LiftedOperation::MOD ||
                             op == LiftedOperation::POW || op == LiftedOperation::CONCAT || op == LiftedOperation::MINUS || op == LiftedOperation::NOT ||
-                            op == LiftedOperation::LENGTH) {
+                            op == LiftedOperation::LENGTH ||
+                            op == LiftedOperation::SETTABLE || op == LiftedOperation::SETTABLEKS || op == LiftedOperation::SETTABLEN ||
+                            op == LiftedOperation::SETUPVAL || op == LiftedOperation::SETGLOBAL) {
                             return true;
                         }
                     }
@@ -2998,7 +3680,13 @@ bool ASTLifter::ShouldInline(const LiftedInstruction *inst) {
                 op == LiftedOperation::POW || op == LiftedOperation::CONCAT || op == LiftedOperation::MINUS || op == LiftedOperation::NOT ||
                 op == LiftedOperation::LENGTH || op == LiftedOperation::JUMPIFEQ || op == LiftedOperation::JUMPIFNOTEQ || op == LiftedOperation::JUMPIFLT ||
                 op == LiftedOperation::JUMPIFNOTLT || op == LiftedOperation::JUMPIFLE || op == LiftedOperation::JUMPIFNOTLE || op == LiftedOperation::JUMPIF ||
-                op == LiftedOperation::JUMPIFNOT || op == LiftedOperation::JUMPXEQK) {
+                op == LiftedOperation::JUMPIFNOT || op == LiftedOperation::JUMPXEQK ||
+                // a call result whose single consumer is a store sink (`t.f = call()`,
+                // `upval = call()`, `glob = call()`) inlines into the store instead of
+                // leaking a `local vN = call()` temp. Each of these lifts its stored
+                // value through LiftExpression(operand[0]).
+                op == LiftedOperation::SETTABLE || op == LiftedOperation::SETTABLEKS || op == LiftedOperation::SETTABLEN ||
+                op == LiftedOperation::SETUPVAL || op == LiftedOperation::SETGLOBAL) {
                 return true;
             }
         }
@@ -3212,7 +3900,11 @@ void ASTLifter::HoistPhiLocals(int32_t mergeIdx, const std::shared_ptr<IfStateme
                     if (!ident || !ident->identifier || ident->identifier->name != name)
                         continue;
 
-                    stmt = std::make_shared<AssignmentStatementNode>(decl->identifier, decl->value);
+                    auto assign = std::make_shared<AssignmentStatementNode>(decl->identifier, decl->value);
+                    assign->debugLine = decl->debugLine;
+                    assign->debugReg = decl->debugReg;
+                    assign->debugOpCode = decl->debugOpCode;
+                    stmt = assign;
                     needsHoist = true;
                     continue;
                 }

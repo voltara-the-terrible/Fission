@@ -7,6 +7,8 @@
 #include "Analysis/RobloxTypeInferer.hpp"
 #include "Rewriters/DeadLocalEliminator.hpp"
 #include "Rewriters/IfChainSimplifier.hpp"
+#include "Rewriters/MoveCoalescer.hpp"
+#include "Rewriters/NilGuardFieldNamer.hpp"
 #include "Rewriters/ShortCircuitFolder.hpp"
 #include "SafetyGuard.hpp"
 
@@ -174,6 +176,30 @@ static std::string FormatDecompilerOptions(DecompilerFlags flags) {
         enabled.emplace_back("AutoNameVariables");
     if ((flags & DecompilerFlags::OmitFissionComments) == DecompilerFlags::OmitFissionComments)
         enabled.emplace_back("OmitFissionComments");
+   if ((flags & DecompilerFlags::Upvalues) == DecompilerFlags::Upvalues)
+        enabled.emplace_back("Upvalues");
+    if ((flags & DecompilerFlags::MinifyUpvalues) == DecompilerFlags::MinifyUpvalues)
+        enabled.emplace_back("MinifyUpvalues");
+    if ((flags & DecompilerFlags::DebugInfo) == DecompilerFlags::DebugInfo)
+        enabled.emplace_back("DebugInfo");
+    if ((flags & DecompilerFlags::FunctionInfo) == DecompilerFlags::FunctionInfo)
+        enabled.emplace_back("FunctionInfo");
+    if ((flags & DecompilerFlags::Constants) == DecompilerFlags::Constants)
+        enabled.emplace_back("Constants");
+    if ((flags & DecompilerFlags::MinifyConstants) == DecompilerFlags::MinifyConstants)
+        enabled.emplace_back("MinifyConstants");
+    if ((flags & DecompilerFlags::Globals) == DecompilerFlags::Globals)
+        enabled.emplace_back("Globals");
+    if ((flags & DecompilerFlags::MinifyGlobals) == DecompilerFlags::MinifyGlobals)
+        enabled.emplace_back("MinifyGlobals");
+    if ((flags & DecompilerFlags::Protos) == DecompilerFlags::Protos)
+        enabled.emplace_back("Protos");
+    if ((flags & DecompilerFlags::MinifyProtos) == DecompilerFlags::MinifyProtos)
+        enabled.emplace_back("MinifyProtos");
+    if ((flags & DecompilerFlags::Semicolons) == DecompilerFlags::Semicolons)
+        enabled.emplace_back("Semicolons");
+    if ((flags & DecompilerFlags::CallLineInfo) == DecompilerFlags::CallLineInfo)
+        enabled.emplace_back("CallLineInfo");
 
     if (enabled.empty())
         return "None";
@@ -217,7 +243,7 @@ static std::optional<std::string> InferExpressionType(const std::shared_ptr<Expr
     if (std::dynamic_pointer_cast<StringLiteralNode>(expr))
         return "string";
     if (std::dynamic_pointer_cast<TableLiteralNode>(expr))
-        return "table";
+        return "{ [any]: any }";
     if (std::dynamic_pointer_cast<FunctionDeclarationNode>(expr))
         return "function";
     if (auto unary = std::dynamic_pointer_cast<UnaryExpressionNode>(expr)) {
@@ -339,6 +365,8 @@ static void CollectFunctionsFromStatements(const std::vector<std::shared_ptr<Sta
             CollectFunctionsFromExpression(forGen->index, functions);
             if (forGen->body)
                 CollectFunctionsFromStatements(forGen->body->body, functions);
+        } else if (auto blk = std::dynamic_pointer_cast<BlockStatementNode>(stmt)) {
+            CollectFunctionsFromStatements(blk->body, functions);
         }
     }
 }
@@ -376,11 +404,11 @@ static void CollectBodyUseFactsFromExpression(const std::shared_ptr<Expression> 
             AddIdentifierUseFact(unary->operand, argName, "number", fact);
         CollectBodyUseFactsFromExpression(unary->operand, argName, fact);
     } else if (auto index = std::dynamic_pointer_cast<IndexExpressionNode>(expr)) {
-        AddIdentifierUseFact(index->left, argName, "table", fact);
+        AddIdentifierUseFact(index->left, argName, "{ [any]: any }", fact);
         CollectBodyUseFactsFromExpression(index->left, argName, fact);
         CollectBodyUseFactsFromExpression(index->right, argName, fact);
     } else if (auto member = std::dynamic_pointer_cast<MemberExpressionNode>(expr)) {
-        AddIdentifierUseFact(member->table, argName, "table", fact);
+        AddIdentifierUseFact(member->table, argName, "{ [any]: any }", fact);
         CollectBodyUseFactsFromExpression(member->table, argName, fact);
         CollectBodyUseFactsFromExpression(member->key, argName, fact);
     } else if (auto call = std::dynamic_pointer_cast<CallExpressionNode>(expr)) {
@@ -388,7 +416,7 @@ static void CollectBodyUseFactsFromExpression(const std::shared_ptr<Expression> 
         for (const auto &arg : call->arguments)
             CollectBodyUseFactsFromExpression(arg, argName, fact);
     } else if (auto nameCall = std::dynamic_pointer_cast<NameCallExpressionNode>(expr)) {
-        AddIdentifierUseFact(nameCall->calledOn, argName, "table", fact);
+        AddIdentifierUseFact(nameCall->calledOn, argName, "{ [any]: any }", fact);
         CollectBodyUseFactsFromExpression(nameCall->calledOn, argName, fact);
         CollectBodyUseFactsFromExpression(nameCall->callWhat, argName, fact);
         for (const auto &arg : nameCall->arguments)
@@ -434,6 +462,8 @@ static void CollectBodyUseFactsFromStatements(const std::vector<std::shared_ptr<
             CollectBodyUseFactsFromStatements(forNum->lpLoopBody->body, argName, fact);
         } else if (auto forGen = std::dynamic_pointer_cast<ForGeneralNode>(stmt); forGen && forGen->body) {
             CollectBodyUseFactsFromStatements(forGen->body->body, argName, fact);
+        } else if (auto blk = std::dynamic_pointer_cast<BlockStatementNode>(stmt)) {
+            CollectBodyUseFactsFromStatements(blk->body, argName, fact);
         }
     }
 }
@@ -524,6 +554,8 @@ static void CollectCallFactsFromStatements(const std::vector<std::shared_ptr<Sta
                 CollectCallFactsFromStatements(forNum->lpLoopBody->body, functions, facts);
         } else if (auto forGen = std::dynamic_pointer_cast<ForGeneralNode>(stmt); forGen && forGen->body) {
             CollectCallFactsFromStatements(forGen->body->body, functions, facts);
+        } else if (auto blk = std::dynamic_pointer_cast<BlockStatementNode>(stmt)) {
+            CollectCallFactsFromStatements(blk->body, functions, facts);
         }
     }
 }
@@ -549,6 +581,8 @@ static void AnnotateLocalDeclarations(std::vector<std::shared_ptr<Statement>> &s
             AnnotateLocalDeclarations(forNum->lpLoopBody->body);
         } else if (auto forGen = std::dynamic_pointer_cast<ForGeneralNode>(stmt); forGen && forGen->body) {
             AnnotateLocalDeclarations(forGen->body->body);
+        } else if (auto blk = std::dynamic_pointer_cast<BlockStatementNode>(stmt)) {
+            AnnotateLocalDeclarations(blk->body);
         }
     }
 }
@@ -608,6 +642,8 @@ static void OptimizeStatements(std::vector<std::shared_ptr<Statement>> &stmts) {
         } else if (auto forGen = std::dynamic_pointer_cast<ForGeneralNode>(stmts[i])) {
             if (forGen->body)
                 OptimizeStatements(forGen->body->body);
+        } else if (auto blk = std::dynamic_pointer_cast<BlockStatementNode>(stmts[i])) {
+            OptimizeStatements(blk->body);
         }
         ++i;
     }
@@ -703,7 +739,7 @@ DecompilationResult Decompiler::CommonDecompilerEntryImpl(const std::string &byt
     const auto ssaEnd = std::chrono::steady_clock::now();
 
     const auto astStart = std::chrono::steady_clock::now();
-    auto liftedAST = ASTLifter.Lift(controlFlowAnalyzedFunction);
+    auto liftedAST = ASTLifter.Lift(controlFlowAnalyzedFunction, flags);
     AddDecompilerOptionsToHeader(liftedAST, flags);
 
     // ---- AST Rewriting ----
@@ -714,7 +750,11 @@ DecompilationResult Decompiler::CommonDecompilerEntryImpl(const std::string &byt
     const auto ifChainStart = std::chrono::steady_clock::now();
     IfChainSimplifier{}.Run(liftedAST.statements);
     const auto ifChainEnd = std::chrono::steady_clock::now();
+    MoveCoalescer{}.Run(liftedAST.statements);
     DeadLocalEliminator{}.Run(liftedAST.statements);
+    // After folding/coalescing have produced the final coherent local, name a nil-guarded
+    // field read (`local vN = t and t.Field`) after the field it guards.
+    NilGuardFieldNamer{}.Run(liftedAST.statements);
     const auto astRewriteEnd = std::chrono::steady_clock::now();
 
     const auto irOptimizationStart = std::chrono::steady_clock::now();
@@ -738,11 +778,15 @@ DecompilationResult Decompiler::CommonDecompilerEntryImpl(const std::string &byt
     RootNode root{liftedAST.statements};
 
     SourceGenerator.bOmitInformationalComments = (flags & DecompilerFlags::OmitFissionComments) == DecompilerFlags::OmitFissionComments;
+    SourceGenerator.bEmitSemicolons = (flags & DecompilerFlags::Semicolons) == DecompilerFlags::Semicolons;
+    SourceGenerator.bEmitCallLineInfo = (flags & DecompilerFlags::CallLineInfo) == DecompilerFlags::CallLineInfo;
+    SourceGenerator.bEmitDebugInfo = (flags & DecompilerFlags::DebugInfo) == DecompilerFlags::DebugInfo;
     const auto sgenStart = std::chrono::steady_clock::now();
     const auto generator = SourceGenerator.GenerateSource(&root);
     const auto sgenEnd = std::chrono::steady_clock::now();
 
-    std::println(std::cout, "generated source code:\n{}", generator);
+    // edit: holy cmd flood.....
+    //std::println(std::cout, "generated source code:\n{}", generator);
 
     const auto printIR = (flags & DecompilerFlags::PrintIR) == DecompilerFlags::PrintIR;
     const auto writeIR = (flags & DecompilerFlags::WriteIRToFile) == DecompilerFlags::WriteIRToFile;

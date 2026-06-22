@@ -121,6 +121,14 @@ struct DeserializedFunction {
     std::int32_t *abslineinfo;
     std::vector<LuauLocalVar> locvars{};
     std::vector<std::string> upvalueNames;
+
+    std::int32_t GetInstructionLine(std::int32_t instructionIndex) const {
+        if (lineinfo.empty() || instructionIndex < 0 || static_cast<std::size_t>(instructionIndex) >= instructions.size())
+            return -1;
+        const std::size_t absoffset = (instructions.size() + 3) & ~static_cast<std::size_t>(3);
+        const auto *absLines = reinterpret_cast<const std::int32_t *>(lineinfo.data() + absoffset);
+        return absLines[instructionIndex >> linegaplog2] + lineinfo[instructionIndex];
+    }
 };
 
 struct DeserializedBytecode {
@@ -150,7 +158,7 @@ class Deserializer {
 
         if (baseType >= LBC_TYPE_TAGGED_USERDATA_BASE && baseType < LBC_TYPE_TAGGED_USERDATA_END) {
             // typeName = typeMap[baseType - LBC_TYPE_TAGGED_USERDATA_BASE];
-            typeName = "any /* userdata, unmapped */";
+            typeName = "typeof(newproxy())?";
         } else {
             switch (baseType) {
             case LBC_TYPE_NIL:
@@ -166,7 +174,7 @@ class Deserializer {
                 typeName = "string";
                 break;
             case LBC_TYPE_TABLE:
-                typeName = "table";
+                typeName = "{ [any]: any }";
                 break;
             case LBC_TYPE_FUNCTION:
                 typeName = "function";
@@ -175,7 +183,7 @@ class Deserializer {
                 typeName = "thread";
                 break;
             case LBC_TYPE_USERDATA:
-                typeName = "userdata";
+                typeName = "typeof(newproxy())";
                 break;
             case LBC_TYPE_VECTOR:
                 typeName = "vector";

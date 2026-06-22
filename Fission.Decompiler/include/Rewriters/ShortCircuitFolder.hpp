@@ -5,11 +5,24 @@
 // expression. The three duplicated `tail` copies must be identical (checked by
 // rendering) for the fold to be sound.
 //
+// Also folds the simpler `T = A or B` diamond. When the `or` result is stored to a
+// table/upvalue (SETTABLEKS/SETUPVAL) rather than kept in a register, Luau lowers it
+// to `local v = A; if v then T = v; <tail> end; local v = B; T = v; <tail>` — the
+// store and everything after it are duplicated into the truthy branch. The two tail
+// copies must render identically and `v` must die with the diamond for the fold.
+//
+// And the `local V = A or B` diamond, where the `or` result stays in the register and
+// the code that *reads* it is what gets duplicated: `local v = A; if v then <tail> end;
+// local v = B; <tail>`. Here both tail copies read `v`, so their identical rendering is
+// itself the soundness proof — when A is truthy the tail runs with v = A, otherwise with
+// v = B, exactly what `local v = A or B; <tail>` evaluates.
+//
 
 #pragma once
 #include "Rewriters/ASTRewriter.hpp"
 #include "SourceGenerator/Generator.hpp"
 
+#include <cctype>
 #include <memory>
 #include <optional>
 #include <string>
@@ -19,7 +32,7 @@ class ShortCircuitFolder : public ASTRewriter {
   protected:
     void RewriteStatements(std::vector<std::shared_ptr<Statement>> &stmts) override {
         for (size_t i = 0; i + 1 < stmts.size();) {
-            if (TryFoldAt(stmts, i))
+            if (TryFoldAt(stmts, i) || TryFoldOrAt(stmts, i) || TryFoldOrLocalAt(stmts, i))
                 continue; // folded in place; re-check the same index
             ++i;
         }
@@ -108,6 +121,175 @@ class ShortCircuitFolder : public ASTRewriter {
         auto orExpr = std::make_shared<BinaryExpressionNode>("or", andExpr, fallback);
         decl->value = orExpr;                                                  // local V = C and P or F
         stmts.erase(stmts.begin() + static_cast<std::ptrdiff_t>(i) + 1);       // drop the diamond
+        return true;
+    }
+
+    static bool IsTerminator(const std::shared_ptr<Statement> &s) {
+        return std::dynamic_pointer_cast<ReturnStatementNode>(s) != nullptr || std::dynamic_pointer_cast<BreakStatementNode>(s) != nullptr ||
+               std::dynamic_pointer_cast<ContinueStatementNode>(s) != nullptr;
+    }
+
+    // value bound to local `v` by `local v = <val>` (declaration, plain assignment, or a Call/NameCall ret), else null.
+    static std::shared_ptr<Expression> AsDeclOfVar(const std::shared_ptr<Statement> &stmt, const std::string &v) {
+        if (auto decl = std::dynamic_pointer_cast<VariableDeclarationNode>(stmt))
+            if (decl->value && SimpleIdentName(decl->identifier).value_or("") == v)
+                return decl->value;
+        return AsAssignToVar(stmt, v);
+    }
+
+    // write target T of `T = v` (rhs is exactly local v), else null.
+    static std::shared_ptr<Expression> AsAssignFromVar(const std::shared_ptr<Statement> &stmt, const std::string &v) {
+        if (auto asn = std::dynamic_pointer_cast<AssignmentStatementNode>(stmt))
+            if (SimpleIdentName(asn->right).value_or("") == v)
+                return asn->left;
+        return nullptr;
+    }
+
+    // render an expression's *value*, ignoring a Call/NameCall's ret binding (which names the temp itself).
+    static std::string RenderValue(const std::shared_ptr<Expression> &e) {
+        SourceGenerator g;
+        if (!e)
+            return "";
+        if (auto nc = std::dynamic_pointer_cast<NameCallExpressionNode>(e)) {
+            if (nc->calledOn)
+                nc->calledOn->Accept(&g);
+            g.buffer << ":";
+            if (nc->callWhat)
+                nc->callWhat->Accept(&g);
+            g.buffer << "(";
+            for (const auto &a : nc->arguments)
+                if (a)
+                    a->Accept(&g);
+            return g.buffer.str();
+        }
+        if (auto c = std::dynamic_pointer_cast<CallExpressionNode>(e)) {
+            if (c->callee)
+                c->callee->Accept(&g);
+            g.buffer << "(";
+            for (const auto &a : c->arguments)
+                if (a)
+                    a->Accept(&g);
+            return g.buffer.str();
+        }
+        e->Accept(&g);
+        return g.buffer.str();
+    }
+
+    // whole-word (identifier-boundary) occurrence of `name` in rendered text.
+    static bool NameInText(const std::string &s, const std::string &name) {
+        if (name.empty())
+            return false;
+        const auto isIdent = [](char c) { return std::isalnum(static_cast<unsigned char>(c)) || c == '_'; };
+        for (size_t pos = s.find(name); pos != std::string::npos; pos = s.find(name, pos + name.size())) {
+            const bool leftOk = pos == 0 || !isIdent(s[pos - 1]);
+            const size_t end = pos + name.size();
+            const bool rightOk = end >= s.size() || !isIdent(s[end]);
+            if (leftOk && rightOk)
+                return true;
+        }
+        return false;
+    }
+
+    // Fold `local v = A; if v then T = v; <tail> end; local v = B; T = v; <tail>` into `T = A or B; <tail>`.
+    static bool TryFoldOrAt(std::vector<std::shared_ptr<Statement>> &stmts, size_t i) {
+        if (i + 3 >= stmts.size())
+            return false;
+
+        // [i] local v = A
+        auto decl = std::dynamic_pointer_cast<VariableDeclarationNode>(stmts[i]);
+        if (!decl || !decl->value)
+            return false;
+        const auto vOpt = SimpleIdentName(decl->identifier);
+        if (!vOpt || vOpt->empty())
+            return false;
+        const std::string v = *vOpt;
+        const auto primary = decl->value; // A
+
+        // [i+1] if v then  T = v ; <tail> (terminating) end   (no else)
+        auto ifS = std::dynamic_pointer_cast<IfStatementNode>(stmts[i + 1]);
+        if (!ifS || !ifS->thenBranch || (ifS->elseBranch && !ifS->elseBranch->body.empty()))
+            return false;
+        if (SimpleIdentName(ifS->condition).value_or("") != v)
+            return false;
+        auto &thenB = ifS->thenBranch->body;
+        if (thenB.empty() || !AsAssignFromVar(thenB[0], v) || !IsTerminator(thenB.back()))
+            return false;
+
+        // [i+2] local v = B
+        const auto fallback = AsDeclOfVar(stmts[i + 2], v); // B
+        if (!fallback)
+            return false;
+
+        // [i+3] T = v
+        auto afterAssign = std::dynamic_pointer_cast<AssignmentStatementNode>(stmts[i + 3]);
+        if (!afterAssign || SimpleIdentName(afterAssign->right).value_or("") != v)
+            return false;
+
+        // the truthy-branch store and the post-diamond store must hit the same target.
+        if (RenderStatements({thenB[0]}) != RenderStatements({stmts[i + 3]}))
+            return false;
+
+        std::vector<std::shared_ptr<Statement>> tailThen(thenB.begin() + 1, thenB.end());
+        std::vector<std::shared_ptr<Statement>> tailAfter(stmts.begin() + static_cast<std::ptrdiff_t>(i) + 4, stmts.end());
+        if (!StatementsEqual(tailThen, tailAfter))
+            return false;
+
+        // v must die with the diamond: if the target, the fallback, or the shared tail still reads it, the fold is unsound.
+        if (NameInText(RenderValue(afterAssign->left), v) || NameInText(RenderValue(fallback), v) || NameInText(RenderStatements(tailAfter), v))
+            return false;
+
+        InlineifyValue(fallback);
+        auto orExpr = std::make_shared<BinaryExpressionNode>("or", primary, fallback);
+        auto folded = std::make_shared<AssignmentStatementNode>(afterAssign->left, orExpr); // T = A or B
+        folded->debugLine = afterAssign->debugLine;
+        folded->debugReg = afterAssign->debugReg;
+        folded->debugOpCode = afterAssign->debugOpCode;
+
+        stmts[i] = folded;
+        stmts.erase(stmts.begin() + static_cast<std::ptrdiff_t>(i) + 1, stmts.begin() + static_cast<std::ptrdiff_t>(i) + 4);
+        return true;
+    }
+
+    // Fold `local v = A; if v then <tail> end; local v = B; <tail>` into `local v = A or B; <tail>`.
+    // The `or` result stays in the local and the duplicated tail reads it, so equal tail renderings
+    // are the soundness proof (truthy → tail with v = A, falsy → tail with v = B).
+    static bool TryFoldOrLocalAt(std::vector<std::shared_ptr<Statement>> &stmts, size_t i) {
+        if (i + 2 >= stmts.size())
+            return false;
+
+        // [i] local v = A
+        auto decl = std::dynamic_pointer_cast<VariableDeclarationNode>(stmts[i]);
+        if (!decl || !decl->value)
+            return false;
+        const auto vOpt = SimpleIdentName(decl->identifier);
+        if (!vOpt || vOpt->empty())
+            return false;
+        const std::string v = *vOpt;
+        const auto primary = decl->value; // A
+
+        // [i+1] if v then <tail> (terminating) end   (no else)
+        auto ifS = std::dynamic_pointer_cast<IfStatementNode>(stmts[i + 1]);
+        if (!ifS || !ifS->thenBranch || (ifS->elseBranch && !ifS->elseBranch->body.empty()))
+            return false;
+        if (SimpleIdentName(ifS->condition).value_or("") != v)
+            return false;
+        auto &thenB = ifS->thenBranch->body;
+        if (thenB.empty() || !IsTerminator(thenB.back()))
+            return false;
+
+        // [i+2] local v = B  (redefinition feeding the falsy path)
+        const auto fallback = AsDeclOfVar(stmts[i + 2], v); // B
+        if (!fallback)
+            return false;
+
+        // the truthy branch must be exactly the post-diamond tail (both read v identically).
+        std::vector<std::shared_ptr<Statement>> tailAfter(stmts.begin() + static_cast<std::ptrdiff_t>(i) + 3, stmts.end());
+        if (tailAfter.empty() || !StatementsEqual(thenB, tailAfter))
+            return false;
+
+        InlineifyValue(fallback);
+        decl->value = std::make_shared<BinaryExpressionNode>("or", primary, fallback);             // local v = A or B
+        stmts.erase(stmts.begin() + static_cast<std::ptrdiff_t>(i) + 1, stmts.begin() + static_cast<std::ptrdiff_t>(i) + 3); // drop if + redecl
         return true;
     }
 };

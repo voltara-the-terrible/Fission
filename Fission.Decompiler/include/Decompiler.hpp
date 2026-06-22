@@ -12,6 +12,7 @@
 #include "ASTLifter.hpp"
 #include "SSABuilder.hpp"
 #include "SourceGenerator/Generator.hpp"
+#include "DecompilerFlags.hpp"
 
 enum class DecompileResult : uint8_t {
     Success,
@@ -19,40 +20,6 @@ enum class DecompileResult : uint8_t {
     FailedToDeserialize,
     FailedToDecompile, // internal failure (malformed/hostile bytecode) caught by the safety boundary
 };
-
-enum class DecompilerFlags : uint16_t {
-    PrintIR = 1 << 0,
-    WriteIRToFile = 1 << 1,
-    GenerateIRGraph = 1 << 2,
-    GenerateSSAIRGraph = 1 << 3,
-    PrintTimingBreakdown = 1 << 4,
-    InferTypes = 1 << 5,
-    OptimizeIR = 1 << 6,
-    InferRobloxTypes = 1 << 7,
-    AutoNameVariables = 1 << 8,
-    // drop Fission's info comments (function info, capture/name notes). warnings + banner still emitted.
-    OmitFissionComments = 1 << 9
-};
-
-constexpr DecompilerFlags operator|(DecompilerFlags lhs, DecompilerFlags rhs) {
-    return static_cast<DecompilerFlags>(static_cast<uint16_t>(lhs) | static_cast<uint16_t>(rhs));
-}
-
-constexpr DecompilerFlags operator&(DecompilerFlags lhs, DecompilerFlags rhs) {
-    return static_cast<DecompilerFlags>(static_cast<uint16_t>(lhs) & static_cast<uint16_t>(rhs));
-}
-
-constexpr DecompilerFlags operator~(DecompilerFlags flag) { return static_cast<DecompilerFlags>(~static_cast<uint16_t>(flag)); }
-
-inline DecompilerFlags &operator|=(DecompilerFlags &lhs, DecompilerFlags rhs) {
-    lhs = lhs | rhs;
-    return lhs;
-}
-
-inline DecompilerFlags &operator&=(DecompilerFlags &lhs, DecompilerFlags rhs) {
-    lhs = lhs & rhs;
-    return lhs;
-}
 
 struct DecompilationResult {
     std::string decompilationOutput;

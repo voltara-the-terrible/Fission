@@ -6,6 +6,7 @@
 #include "AbstractSyntaxTree/ASTNode.hpp"
 #include "ControlFlowAnalyzer.hpp"
 #include "Deserializer.hpp"
+#include "DecompilerFlags.hpp"
 #include "lua.h"
 
 #include <memory>
@@ -26,7 +27,8 @@ class ASTLifter {
     std::shared_ptr<Expression> InvertCondition(const std::shared_ptr<Expression> &cond);
     explicit ASTLifter();
 
-    ASTFunction Lift(AnalyzedFunction &analyzedFunction);
+    DecompilerFlags m_flags;
+    ASTFunction Lift(AnalyzedFunction &analyzedFunction, DecompilerFlags flags);
     std::shared_ptr<Expression> LiftCondition(const LiftedInstruction *inst);
 
     std::unordered_set<int32_t> m_definedRegisters;
@@ -68,6 +70,16 @@ class ASTLifter {
     std::vector<uint32_t> m_loopExitStack;
 
     std::vector<std::shared_ptr<Statement>> LiftControlFlow(uint32_t currentBlockId, uint32_t stopBlockId, std::set<uint32_t> &visited);
+
+    // Recover `do ... end` lexical scopes from register reuse. The Luau register allocator
+    // only reuses a register slot for a fresh `local` once the previous occupant's lexical
+    // scope has closed, so in straight-line code a register reused by a later materialized
+    // local is the signature of a closed block. Wraps each recovered scope in a
+    // BlockStatementNode with bIsScopeBlock = true. `minBaseReg` is the floor below which a
+    // register cannot anchor a new scope (set when recursing into an already-recovered block
+    // so deeper nesting only fires on strictly higher registers). Heuristic only — never uses
+    // locvar debug info. Conservative by design: when in doubt it leaves statements untouched.
+    void ReconstructScopes(std::vector<std::shared_ptr<Statement>> &stmts, int32_t minBaseReg);
     std::string GetFunctionName(DeserializedFunction *lpDeserialized) {
         if (lpDeserialized->debugName.has_value())
             return std::format("{}", *lpDeserialized->debugName);

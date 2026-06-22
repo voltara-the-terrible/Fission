@@ -39,6 +39,46 @@ static bool IsGeneratedName(const std::string &name) {
     return false;
 }
 
+// A derived name equal to a Luau keyword would produce uncompilable Luau if used verbatim as a
+// local. Roblox instances/fields can legally be named with these (a child literally called "end"),
+// so guard against it.
+static bool IsReservedLuauKeyword(const std::string &name) {
+    static const std::set<std::string> kKeywords = {"and",   "break", "do",     "else",  "elseif", "end",   "false", "for",
+                                                    "function", "if",    "in",     "local", "nil",    "not",   "or",    "repeat",
+                                                    "return", "then",  "true",   "until", "while"};
+    return kKeywords.contains(name);
+}
+
+// Lowercase only the first character: `CFrame` -> `cFrame`, `Vector3` -> `vector3`. Turns a
+// datatype name into the conventional spelling of a value of that type.
+static std::string LowerFirstChar(std::string name) {
+    if (!name.empty())
+        name[0] = static_cast<char>(std::tolower(static_cast<unsigned char>(name[0])));
+    return name;
+}
+
+// Known Roblox datatype libraries whose constructors (`.new`, `.fromRGB`, `.Angles`, ...) yield a
+// value of the same-named type. Returns the datatype name for `<Library>.<ctor>(...)`, else nullopt.
+// `Instance` and `Enum` are deliberately excluded: `Instance.new("Part")` is better named/typed
+// after its class argument, which the caller handles separately.
+static std::optional<std::string> DatatypeConstructor(const std::string &library, const std::string &method) {
+    static const std::set<std::string> kLibraries = {
+        "CFrame",   "Vector3",     "Vector2",      "Vector3int16",   "Vector2int16",   "Color3",
+        "UDim",     "UDim2",       "Rect",         "Region3",        "Region3int16",   "Ray",
+        "NumberRange", "NumberSequence", "ColorSequence", "NumberSequenceKeypoint", "ColorSequenceKeypoint",
+        "PhysicalProperties", "BrickColor", "TweenInfo", "Random",   "DateTime",       "RaycastParams",
+        "OverlapParams", "Font",   "PathWaypoint"};
+    static const std::set<std::string> kConstructors = {
+        "new",       "fromRGB",          "fromHSV",           "fromHex",        "fromName",
+        "Angles",    "fromEulerAnglesXYZ", "fromEulerAnglesYXZ", "fromAxisAngle", "fromMatrix",
+        "lookAt",    "fromOrientation",  "fromOffset",        "fromScale",      "fromNormalId",
+        "fromUnixTimestamp", "fromUnixTimestampMillis", "fromIsoDate", "fromLocalTime", "fromUniversalTime",
+        "now"};
+    if (kLibraries.contains(library) && kConstructors.contains(method))
+        return library;
+    return std::nullopt;
+}
+
 std::optional<std::string> RobloxTypeInferer::StringLiteralValue(const std::shared_ptr<Expression> &expr) {
     if (auto str = std::dynamic_pointer_cast<StringLiteralNode>(expr))
         return str->value;
@@ -94,17 +134,19 @@ RobloxTypeInferer::CallReturnType(const std::string &methodName, const std::vect
     if (methodName == "insert" || methodName == "remove" || methodName == "sort" || methodName == "clear")
         return std::nullopt;
     if (methodName == "create" || methodName == "freeze" || methodName == "clone" || methodName == "pack")
-        return "table";
+        return "{ [any]: any }";
     if (methodName == "find")
         return "number";
     if (methodName == "keys" || methodName == "values")
-        return "table";
+        return "{ [any]: any }";
     if (methodName == "concat")
         return "string";
     if (methodName == "maxn" || methodName == "getn")
         return "number";
 
     if (methodName == "clock" || methodName == "time" || methodName == "difftime")
+        return "number";
+    if (methodName == "GetServerTimeNow" || methodName == "GetServerTimeNowAsync")
         return "number";
     if (methodName == "date")
         return "string";
@@ -171,10 +213,12 @@ std::optional<std::string> RobloxTypeInferer::GlobalFunctionType(const std::stri
         if (args.size() >= 2)
             if (auto secondType = IdentifierName(args[1]); secondType && !IsGeneratedName(*secondType))
                 return *secondType;
-        return "table";
+        return "{ [any]: any }";
     }
+    if (name == "tick" || name == "time" || name == "elapsedTime")
+        return "number";
     if (name == "require" || name == "newproxy")
-        return "table";
+        return "{ [any]: any }";
     if (name == "next" || name == "pairs" || name == "ipairs")
         return "function";
     if (name == "loadstring")
@@ -182,14 +226,16 @@ std::optional<std::string> RobloxTypeInferer::GlobalFunctionType(const std::stri
     if (name == "collectgarbage" || name == "gcinfo")
         return "number";
     if (name == "getfenv")
-        return "table";
+        return "{ [any]: any }";
     (void)args;
     return std::nullopt;
 }
 
 std::optional<std::string> RobloxTypeInferer::GlobalFunctionAutoName(const std::string &name, const std::vector<std::shared_ptr<Expression>> &args) {
-    (void)name;
     (void)args;
+    // `tick()` / `os.time`-style globals produce a time value; `timestamp` recovers the intent.
+    if (name == "tick" || name == "time" || name == "elapsedTime")
+        return "timestamp";
     return std::nullopt;
 }
 
@@ -302,9 +348,19 @@ std::optional<std::string> RobloxTypeInferer::ExpressionType(const std::shared_p
 
     if (auto call = std::dynamic_pointer_cast<CallExpressionNode>(expr)) {
         if (auto member = std::dynamic_pointer_cast<MemberExpressionNode>(call->callee)) {
-            if (auto methodName = MemberKeyName(member->key))
+            auto libName = IdentifierName(member->table);
+            if (auto methodName = MemberKeyName(member->key)) {
+                // `Instance.new("Part")` is typed as its class; other `<Datatype>.new(...)` as the datatype.
+                if (libName) {
+                    if (*libName == "Instance" && *methodName == "new")
+                        if (auto cls = ClassArgument(call->arguments, 0))
+                            return cls;
+                    if (auto dt = DatatypeConstructor(*libName, *methodName))
+                        return *dt;
+                }
                 if (auto result = CallReturnType(*methodName, call->arguments, 1))
                     return result;
+            }
         }
         if (auto globalId = std::dynamic_pointer_cast<IdentifierExpressionNode>(call->callee)) {
             if (auto gname = IdentifierName(globalId))
@@ -317,17 +373,38 @@ std::optional<std::string> RobloxTypeInferer::ExpressionType(const std::shared_p
 }
 
 std::optional<std::string> RobloxTypeInferer::ExpressionAutoName(const std::shared_ptr<Expression> &expr) {
+    if (!expr)
+        return std::nullopt;
+
     if (auto nameCall = std::dynamic_pointer_cast<NameCallExpressionNode>(expr)) {
-        if (auto methodName = IdentifierName(nameCall->callWhat))
+        if (auto methodName = IdentifierName(nameCall->callWhat)) {
             if (auto result = CallAutoName(*methodName, nameCall->arguments, 0))
                 return result;
+            // `workspace:GetServerTimeNow()` and friends → timestamp.
+            if (*methodName == "GetServerTimeNow" || *methodName == "GetServerTimeNowAsync")
+                return std::string("timestamp");
+        }
     }
 
     if (auto call = std::dynamic_pointer_cast<CallExpressionNode>(expr)) {
         if (auto member = std::dynamic_pointer_cast<MemberExpressionNode>(call->callee)) {
-            if (auto methodName = MemberKeyName(member->key))
+            auto tableName = IdentifierName(member->table);
+            if (auto methodName = MemberKeyName(member->key)) {
                 if (auto result = CallAutoName(*methodName, call->arguments, 1))
                     return result;
+                // `Instance.new("ClassName")` → ClassName.
+                if (*methodName == "new" && tableName && *tableName == "Instance")
+                    if (auto cls = ClassArgument(call->arguments, 0))
+                        return cls;
+                if (tableName) {
+                    // `CFrame.new(...)` → cFrame, `Vector3.new(...)` → vector3, etc.
+                    if (auto dt = DatatypeConstructor(*tableName, *methodName))
+                        return LowerFirstChar(*dt);
+                    // `os.clock()` / `os.time()` → timestamp.
+                    if (*tableName == "os" && (*methodName == "clock" || *methodName == "time"))
+                        return std::string("timestamp");
+                }
+            }
         }
         if (auto globalId = std::dynamic_pointer_cast<IdentifierExpressionNode>(call->callee)) {
             if (auto gname = IdentifierName(globalId))
@@ -336,6 +413,34 @@ std::optional<std::string> RobloxTypeInferer::ExpressionAutoName(const std::shar
         }
     }
 
+    // Field access: `Players.LocalPlayer` / `humanoid.RootPart` → the accessed field name. This is the
+    // most common shape of a named value in decompiled Roblox code, so naming the local after the field
+    // it reads recovers the original intent in the vast majority of cases.
+    if (auto member = std::dynamic_pointer_cast<MemberExpressionNode>(expr)) {
+        if (member->table != nullptr)
+            if (auto keyName = MemberKeyName(member->key))
+                return keyName;
+    }
+
+    // Indexed access with a constant string key: `t["LocalPlayer"]` → LocalPlayer.
+    if (auto index = std::dynamic_pointer_cast<IndexExpressionNode>(expr)) {
+        if (auto keyStr = StringLiteralValue(index->right))
+            return keyStr;
+    }
+
+    // Bare literals get a short, type-coded base name (always numbered downstream: n1, s1, t1, ...),
+    // mirroring conventional decompiler output for values whose type is obvious from the literal.
+    if (std::dynamic_pointer_cast<VectorNode>(expr))
+        return std::string("vector3");
+    if (std::dynamic_pointer_cast<NumberLiteralNode>(expr) || std::dynamic_pointer_cast<IntegerLiteralNode>(expr))
+        return std::string("n");
+    if (std::dynamic_pointer_cast<StringLiteralNode>(expr))
+        return std::string("s");
+    if (std::dynamic_pointer_cast<BooleanLiteralNode>(expr))
+        return std::string("b");
+    if (std::dynamic_pointer_cast<TableLiteralNode>(expr))
+        return std::string("t");
+
     return std::nullopt;
 }
 
@@ -343,25 +448,36 @@ std::string RobloxTypeInferer::ResolveAutoName(const std::string &currentName, c
     auto clean = SanitizeIdentifier(wantedName);
     if (clean.empty())
         return currentName;
-    if (currentName == clean && !m_autoNames.contains(clean)) {
-        m_autoNames.insert(clean);
-        return currentName;
-    }
-    if (!m_names.contains(clean)) {
-        m_names.erase(currentName);
-        m_names.insert(clean);
-        m_autoNames.insert(clean);
-        return clean;
+    if (IsReservedLuauKeyword(clean))
+        clean += "_";
+
+    // Single-letter type codes (n, s, t, b) are always numbered — n1, n2, ... — so a literal-typed
+    // local never renders as a bare `n`. Word names take the bare form first (cFrame) and pick up a
+    // numeric suffix only on collision (cFrame2, cFrame3).
+    const bool alwaysNumber = clean.size() == 1;
+
+    if (!alwaysNumber) {
+        if (currentName == clean && !m_autoNames.contains(clean)) {
+            m_autoNames.insert(clean);
+            return currentName;
+        }
+        if (!m_names.contains(clean)) {
+            m_names.erase(currentName);
+            m_names.insert(clean);
+            m_autoNames.insert(clean);
+            return clean;
+        }
     }
 
-    std::string prefixed;
+    std::string numbered;
+    int32_t counter = alwaysNumber ? 1 : 2;
     do {
-        prefixed = std::format("v{}_{}", ++m_autoNameCounter, clean);
-    } while (m_names.contains(prefixed));
+        numbered = std::format("{}{}", clean, counter++);
+    } while (m_names.contains(numbered));
     m_names.erase(currentName);
-    m_names.insert(prefixed);
-    m_autoNames.insert(prefixed);
-    return prefixed;
+    m_names.insert(numbered);
+    m_autoNames.insert(numbered);
+    return numbered;
 }
 
 void RobloxTypeInferer::RenameIdentifier(const std::shared_ptr<Expression> &expr, const std::string &name) {
@@ -437,9 +553,135 @@ void RobloxTypeInferer::Visit(RootNode *lpNode) {
 void RobloxTypeInferer::Visit(FunctionArgumentExpression *lpNode) { VisitNode(lpNode->argumentName); }
 void RobloxTypeInferer::Visit(VectorNode *lpNode) { (void)lpNode; }
 
+// The Identifier backing a function's first parameter, or nullptr.
+static std::shared_ptr<Identifier> FirstParamIdentifier(FunctionDeclarationNode *fn) {
+    if (!fn || fn->argumentCount < 1)
+        return nullptr;
+    auto it = fn->argumentsNames.find(0);
+    if (it == fn->argumentsNames.end() || !it->second)
+        return nullptr;
+    const auto &argName = it->second->argumentName;
+    if (auto idExpr = std::dynamic_pointer_cast<IdentifierExpressionNode>(argName))
+        return idExpr->identifier;
+    if (auto id = std::dynamic_pointer_cast<Identifier>(argName))
+        return id;
+    return nullptr;
+}
+
+// Is `name` used anywhere in `node` as the receiver of a field/method/index access
+// (`name.x`, `name:m()`, `name[k]`)? Deliberately does NOT descend into nested function
+// bodies, whose own `arg0` is an unrelated variable that merely shares the spelling.
+static bool NameUsedAsReceiver(const std::shared_ptr<ASTNode> &node, const std::string &name) {
+    if (!node)
+        return false;
+
+    auto isName = [&](const std::shared_ptr<Expression> &e) -> bool {
+        if (auto id = std::dynamic_pointer_cast<IdentifierExpressionNode>(e); id && id->identifier)
+            return id->identifier->name == name;
+        if (auto id = std::dynamic_pointer_cast<Identifier>(e))
+            return id->name == name;
+        return false;
+    };
+
+    if (auto member = std::dynamic_pointer_cast<MemberExpressionNode>(node))
+        return isName(member->table) || NameUsedAsReceiver(member->table, name) || NameUsedAsReceiver(member->key, name);
+    if (auto index = std::dynamic_pointer_cast<IndexExpressionNode>(node))
+        return isName(index->left) || NameUsedAsReceiver(index->left, name) || NameUsedAsReceiver(index->right, name);
+    if (auto nameCall = std::dynamic_pointer_cast<NameCallExpressionNode>(node)) {
+        if (isName(nameCall->calledOn) || NameUsedAsReceiver(nameCall->calledOn, name) || NameUsedAsReceiver(nameCall->callWhat, name))
+            return true;
+        for (const auto &a : nameCall->arguments)
+            if (NameUsedAsReceiver(a, name))
+                return true;
+        return false;
+    }
+    if (auto call = std::dynamic_pointer_cast<CallExpressionNode>(node)) {
+        if (NameUsedAsReceiver(call->callee, name))
+            return true;
+        for (const auto &a : call->arguments)
+            if (NameUsedAsReceiver(a, name))
+                return true;
+        return false;
+    }
+    if (auto bin = std::dynamic_pointer_cast<BinaryExpressionNode>(node))
+        return NameUsedAsReceiver(bin->left, name) || NameUsedAsReceiver(bin->right, name);
+    if (auto un = std::dynamic_pointer_cast<UnaryExpressionNode>(node))
+        return NameUsedAsReceiver(un->operand, name);
+    if (auto tbl = std::dynamic_pointer_cast<TableLiteralNode>(node)) {
+        for (const auto &e : tbl->expressions)
+            if (NameUsedAsReceiver(e, name))
+                return true;
+        return false;
+    }
+    if (auto block = std::dynamic_pointer_cast<BlockStatementNode>(node)) {
+        for (const auto &s : block->body)
+            if (NameUsedAsReceiver(s, name))
+                return true;
+        return false;
+    }
+    if (auto es = std::dynamic_pointer_cast<ExpressionStatementNode>(node))
+        return NameUsedAsReceiver(es->expression, name);
+    if (auto ret = std::dynamic_pointer_cast<ReturnStatementNode>(node)) {
+        for (const auto &v : ret->returnValues)
+            if (NameUsedAsReceiver(v, name))
+                return true;
+        return false;
+    }
+    if (auto asgn = std::dynamic_pointer_cast<AssignmentStatementNode>(node))
+        return NameUsedAsReceiver(asgn->left, name) || NameUsedAsReceiver(asgn->right, name);
+    if (auto cb = std::dynamic_pointer_cast<CompoundBinaryExpressionNode>(node))
+        return NameUsedAsReceiver(cb->left, name) || NameUsedAsReceiver(cb->right, name);
+    if (auto decl = std::dynamic_pointer_cast<VariableDeclarationNode>(node))
+        return NameUsedAsReceiver(decl->value, name);
+    if (auto iff = std::dynamic_pointer_cast<IfStatementNode>(node))
+        return NameUsedAsReceiver(iff->condition, name) || NameUsedAsReceiver(iff->thenBranch, name) || NameUsedAsReceiver(iff->elseBranch, name);
+    if (auto wh = std::dynamic_pointer_cast<WhileStatementNode>(node))
+        return NameUsedAsReceiver(wh->condition, name) || NameUsedAsReceiver(wh->body, name);
+    if (auto rep = std::dynamic_pointer_cast<RepeatStatementNode>(node))
+        return NameUsedAsReceiver(rep->body, name) || NameUsedAsReceiver(rep->condition, name);
+    if (auto fn = std::dynamic_pointer_cast<ForNumericNode>(node))
+        return NameUsedAsReceiver(fn->lpLoopBody, name) || NameUsedAsReceiver(fn->startVariable, name) || NameUsedAsReceiver(fn->maxIncreased, name) ||
+               NameUsedAsReceiver(fn->increaseBy, name);
+    if (auto fg = std::dynamic_pointer_cast<ForGeneralNode>(node))
+        return NameUsedAsReceiver(fg->body, name) || NameUsedAsReceiver(fg->generator, name) || NameUsedAsReceiver(fg->state, name) ||
+               NameUsedAsReceiver(fg->index, name);
+    // FunctionDeclarationNode and leaves: stop (a nested function's `arg0` is unrelated).
+    return false;
+}
+
 void RobloxTypeInferer::Visit(FunctionDeclarationNode *lpNode) {
+    const bool methodHint = m_methodSelfHint;
+    m_methodSelfHint = false; // consume; nested functions re-derive their own.
+
+    // m_renames is inherited into nested bodies (not cleared on entry), so isolate this function's
+    // parameter decision and restore on exit — otherwise one method's `arg0 -> self` would bleed into
+    // a sibling/nested function that also spells its first parameter `arg0`.
+    auto savedRenames = m_renames;
+
+    if (m_autoNameVariables) {
+        const bool dottedName = lpNode->functionName.find('.') != std::string::npos;
+        const bool colonName = lpNode->functionName.find(':') != std::string::npos;
+        const bool isMethod = methodHint || dottedName || colonName;
+
+        if (auto firstParam = FirstParamIdentifier(lpNode)) {
+            const std::string paramName = firstParam->name;
+            const bool generated = paramName.rfind("arg", 0) == 0; // only touch generated `argN` names.
+            // A colon method (`T:m()`) is self by definition; for the dot/member form require that the
+            // parameter is actually used like an object so static table functions keep their argument.
+            const bool usedAsSelf = lpNode->lpFunctionBody && NameUsedAsReceiver(lpNode->lpFunctionBody, paramName);
+            if (isMethod && generated && (colonName || usedAsSelf)) {
+                firstParam->name = "self";
+                m_renames[paramName] = "self"; // route body references through the rename.
+            } else {
+                m_renames.erase(paramName); // drop any inherited `arg0 -> self` for this body.
+            }
+        }
+    }
+
     if (lpNode->lpFunctionBody)
         VisitStatementList(lpNode->lpFunctionBody->body, m_env);
+
+    m_renames = savedRenames;
 }
 
 void RobloxTypeInferer::Visit(CallExpressionNode *lpNode) {
@@ -481,7 +723,7 @@ void RobloxTypeInferer::Visit(ExpressionStatementNode *lpNode) {
                 if (auto wanted = ExpressionAutoName(call)) {
                     auto resolved = ResolveAutoName(*current, *wanted);
                     RenameIdentifier(call->rets[0], resolved);
-                    if (resolved != *current && (*current != *wanted || SanitizeIdentifier(*wanted) != *wanted)) {
+                    if (resolved != *current) {
                         m_renames[*current] = resolved;
                         if (m_env.contains(*current))
                             m_env[resolved] = m_env.at(*current);
@@ -495,7 +737,7 @@ void RobloxTypeInferer::Visit(ExpressionStatementNode *lpNode) {
                 if (auto wanted = ExpressionAutoName(nameCall)) {
                     auto resolved = ResolveAutoName(*current, *wanted);
                     RenameIdentifier(nameCall->rets[0], resolved);
-                    if (resolved != *current && (*current != *wanted || SanitizeIdentifier(*wanted) != *wanted)) {
+                    if (resolved != *current) {
                         m_renames[*current] = resolved;
                         if (m_env.contains(*current))
                             m_env[resolved] = m_env.at(*current);
@@ -527,7 +769,12 @@ void RobloxTypeInferer::Visit(AssignmentStatementNode *lpNode) {
             if (auto type = ExpressionType(lpNode->right, m_env))
                 m_env[*name] = *type;
     VisitNode(lpNode->left);
+    // `T.method = function(arg0, ...)` defines a method; flag the closure so its receiver becomes `self`.
+    if (m_autoNameVariables && std::dynamic_pointer_cast<MemberExpressionNode>(lpNode->left) &&
+        std::dynamic_pointer_cast<FunctionDeclarationNode>(lpNode->right))
+        m_methodSelfHint = true;
     VisitNode(lpNode->right);
+    m_methodSelfHint = false;
 }
 
 void RobloxTypeInferer::Visit(TableBinaryExpressionNode *lpNode) { Visit(static_cast<BinaryExpressionNode *>(lpNode)); }
@@ -555,7 +802,11 @@ void RobloxTypeInferer::Visit(VariableDeclarationNode *lpNode) {
             if (auto wanted = ExpressionAutoName(lpNode->value)) {
                 auto resolved = ResolveAutoName(*current, *wanted);
                 RenameIdentifier(lpNode->identifier, resolved);
-                if (resolved != *current && (*current != *wanted || SanitizeIdentifier(*wanted) != *wanted)) {
+                // Propagate to uses whenever the definition's name actually changed — INCLUDING the
+                // collision-mangled `v{N}_{name}` case. Skipping it (as the old guard did when the
+                // source name already equalled the field) left the def as `local v1_Head` while every
+                // use stayed bare `Head`, i.e. a read of an undeclared global.
+                if (resolved != *current) {
                     m_renames[*current] = resolved;
                     if (m_env.contains(*current))
                         m_env[resolved] = m_env.at(*current);

@@ -79,6 +79,16 @@ if (CXX_COMPILER_KIND STREQUAL "clang-cl")
     MESSAGE(FATAL_ERROR "Clang (with MSVC front-end) is not supported! Please use clang with a GNU front-end, or the Visual C/C++ compiler instead.")
 endif ()
 
+# CPM dependencies (Boost, Luau, ...) are built with the global CMAKE_CXX_FLAGS, NOT our per-target
+# CXX_COMPILE_OPTIONS. If the configure overrides CMAKE_CXX_FLAGS (e.g. to "/WX-") it drops MSVC's
+# default /EHsc, so dependencies compile without C++ exceptions: _CPPUNWIND goes undefined, Boost
+# defines BOOST_NO_EXCEPTIONS, and the compiled Boost.JSON lib emits an undefined external reference
+# to boost::throw_exception (LNK2019). Force /EHsc globally BEFORE adding dependencies so they build
+# with exceptions enabled, consistently with our own targets. Must precede the CPMAddPackage calls.
+if (CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/EHsc>)
+endif ()
+
 CPMAddPackage(
         NAME libassert
         GITHUB_REPOSITORY jeremy-rifkin/libassert
@@ -154,7 +164,7 @@ if (CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "GNU")
 
 elseif (CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
 #msvc flags.
-    set(CXX_COMPILE_OPTIONS /arch:AVX2 /WX /W4 /permissive- /Zc:preprocessor /Ob3 /O2 /Ot
+    set(CXX_COMPILE_OPTIONS /arch:AVX2 /EHsc /WX- /W4 /permissive- /Zc:preprocessor /Ob3 /O2 /Ot
             /wd4127 #[==[ conditional expression is constant ]==]
             /wd4068 #[==[ unknown pragma '...' ]==]
             /wd4324 #[==[ THIS IS A REALLY STUPID WARNING, MSVC WHY? ]==]
@@ -179,7 +189,7 @@ elseif (CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
 
     if (DEBUG_INFORMATION_EXTENSIVE)
         list(APPEND CXX_COMPILE_OPTIONS /Z7)
-        list(APPEND CXX_LINK_OPTIONS /Z7)
+        list(APPEND CXX_LINK_OPTIONS /DEBUG) # /Z7 is a compiler-only flag; the linker emits debug info via /DEBUG (LNK4044).
     endif ()
 
 endif ()
@@ -212,6 +222,7 @@ add_library(Fission.Decompiler STATIC
         Fission.Decompiler/include/SourceGenerator/Generator.hpp
         Fission.Decompiler/include/Rewriters/ASTRewriter.hpp
         Fission.Decompiler/include/Rewriters/IfChainSimplifier.hpp
+        Fission.Decompiler/include/Rewriters/MoveCoalescer.hpp
         Fission.Decompiler/include/Rewriters/ShortCircuitFolder.hpp
         Fission.Decompiler/include/AbstractSyntaxTree/ASTNode.hpp
         Fission.Decompiler/include/AbstractSyntaxTree/Nodes/RootNode.hpp
@@ -231,9 +242,20 @@ add_executable(Fission.CLI
         Fission.Decompiler/include/Decompiler.hpp
         Fission.Decompiler/include/ASTLifter.hpp
 )
-target_link_libraries(Fission.CLI PUBLIC Fission.Decompiler)
+target_link_libraries(Fission.CLI PUBLIC Fission.Decompiler Boost::beast Boost::asio Boost::system Boost::throw_exception Boost::exception)
 target_compile_options(Fission.CLI PRIVATE ${CXX_COMPILE_OPTIONS})
 target_link_options(Fission.CLI PRIVATE ${CXX_LINK_OPTIONS})
+
+add_executable(Fission.Executor
+        Fission.Executor/src/main.cpp
+        Fission.Decompiler/include/BytecodeLifter.hpp
+        Fission.Decompiler/include/Decompiler.hpp
+        Fission.Decompiler/include/ASTLifter.hpp
+)
+set_target_properties(Fission.Executor PROPERTIES OUTPUT_NAME FissionDecompiler)
+target_link_libraries(Fission.Executor PUBLIC Fission.Decompiler Boost::beast Boost::asio Boost::system Boost::throw_exception Boost::exception Boost::json)
+target_compile_options(Fission.Executor PRIVATE ${CXX_COMPILE_OPTIONS})
+target_link_options(Fission.Executor PRIVATE ${CXX_LINK_OPTIONS})
 
 if (BUILD_TESTING)
     CPMAddPackage(

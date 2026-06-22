@@ -48,6 +48,25 @@ static const std::array<AccessType, 256> kOpcodeAccessTable = [] {
     return table;
 }();
 
+// FASTCALL* are builtin fast-path hints the compiler emits alongside the real
+// fallback CALL on the SAME argument registers. The lifter reconstructs every
+// call from CALL/CALLFB/NAMECALL and never from a FASTCALL, so a FASTCALL's
+// operand reads are pure duplicates of the paired call's reads. Counting them
+// double-counts each fast-call argument and prevents single-use temps (e.g. the
+// table/metatable in `setmetatable({}, mt)`) from inlining into the call.
+static bool IsFastCallOp(LiftedOperation op) {
+    switch (op) {
+    case LiftedOperation::FASTCALL:
+    case LiftedOperation::FASTCALL1:
+    case LiftedOperation::FASTCALL2:
+    case LiftedOperation::FASTCALL2K:
+    case LiftedOperation::FASTCALL3:
+        return true;
+    default:
+        return false;
+    }
+}
+
 AccessType SSABuilder::GetRegisterAccess(const LiftedInstruction &op, size_t operandIndex) {
     const AccessType baseType = kOpcodeAccessTable[static_cast<size_t>(op.operation)];
 
@@ -69,18 +88,37 @@ int CalculateLuaStackForInstruction(AnalyzedFunction &func, LiftedInstruction &i
     if (inst.operands[1].value.imm.n != 0 /* not actually var arg, why the fuck was this called? */)
         return 0;
 
-    uint8_t maxRegister = inst.operands[0].value.reg;
+    const int32_t regStart = inst.operands[0].value.reg;
+    const auto &instructions = func.lpLiftedFunction->instructions;
 
-    for (const auto &insn : func.lpLiftedFunction->instructions) {
+    // A multiret CALL (B==0) takes regStart+1 .. top, where `top` is the result base of the most
+    // recent preceding multiret call (C==0) above regStart — that call's spread is this call's
+    // trailing argument. Bounding the scan there (instead of at the global max register used so far)
+    // stops registers from already-consumed inner call frames — e.g. a closure passed to an inner
+    // method call in `outer(x, inner:m(closure))` — from being miscounted as arguments of this call
+    // too, which would inflate their use counts and block single-use inlining.
+    int32_t lastProducerBase = -1;
+    for (const auto &prev : instructions) {
+        if (prev.instructionIndex >= inst.instructionIndex)
+            break;
+        if ((prev.operation == LiftedOperation::CALL || prev.operation == LiftedOperation::CALLFB) && prev.operands.size() >= 3 &&
+            prev.operands[2].value.imm.n == 0)
+            lastProducerBase = prev.operands[0].value.reg;
+    }
+    if (lastProducerBase > regStart)
+        return lastProducerBase - regStart;
+
+    // Fallback (no preceding multiret producer identified): the original conservative scan.
+    uint8_t maxRegister = inst.operands[0].value.reg;
+    for (const auto &insn : instructions) {
         if (insn.instructionIndex == inst.instructionIndex)
-            break; // going further will break this.
+            break;
         for (const auto &ops : insn.operands) {
             if (ops.type == LiftedOperandType::Register)
                 maxRegister = std::max(maxRegister, ops.value.reg);
         }
     }
-
-    return maxRegister - inst.operands[0].value.reg; // regMax - regStart ; basic for fucking vararg.
+    return maxRegister - inst.operands[0].value.reg;
 }
 
 std::vector<int> SSABuilder::GetImplicitDefinitions(const LiftedInstruction &inst) {
@@ -471,8 +509,12 @@ void SSABuilder::Rename(int blockId, AnalyzedFunction &func, const std::map<int3
                     }
 
                     auto ref = SSARef{reg, CurrentVersion(reg)};
-                    func.useCounts[ref]++;
-                    func.users[ref].push_back(inst);
+                    // Keep the version assignment above (so register numbering is unchanged)
+                    // but don't record a FASTCALL's read as a use — see IsFastCallOp.
+                    if (!IsFastCallOp(inst->operation)) {
+                        func.useCounts[ref]++;
+                        func.users[ref].push_back(inst);
+                    }
                 }
             }
 
