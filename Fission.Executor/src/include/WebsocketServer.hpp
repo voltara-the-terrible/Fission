@@ -122,10 +122,11 @@ namespace Fission {
                               }
                                     
                         } else if (flags.is_object()) {
+                              
                               for (const auto &kv : flags.as_object()) {
                                     if (kv.value().is_bool() && kv.value().as_bool()) {
                                           if (auto f = FlagFromName(kv.key())) {
-                                                result |= *f
+                                                result |= *f;
                                           }
                                     }
                               }
