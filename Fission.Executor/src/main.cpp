@@ -14,6 +14,7 @@ int main(int argc, char *argv[]) {
     Decompiler decompiler{};
 
     if (argc > 1) {
+        
         const std::string_view first = argv[1];
         if (first == "-h" || first == "--help") {
             Fission::Executor::PrintUsage(std::cout, argv[0]);

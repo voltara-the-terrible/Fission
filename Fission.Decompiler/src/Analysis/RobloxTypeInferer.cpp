@@ -5,56 +5,80 @@
 #include <cctype>
 #include <format>
 
+static const std::set<std::string> RESERVED_KEYWORDS = {
+      "and", "break", "do", "else", "elseif", "end", "false", "for",
+      "function", "if", "in", "local", "nil", "not", "or", "repeat",
+      "return", "then", "true", "until", "while"
+};
+
+
+
+
+
+
+
 std::shared_ptr<Expression> RobloxTypeInferer::MakeTypeAnnotation(const std::string &typeName) {
-    return std::make_shared<IdentifierExpressionNode>(std::make_shared<Identifier>(typeName));
+      return std::make_shared<IdentifierExpressionNode>(std::make_shared<Identifier>(typeName));
 }
 
 std::optional<std::string> RobloxTypeInferer::IdentifierName(const std::shared_ptr<Expression> &expr) {
-    if (auto id = std::dynamic_pointer_cast<IdentifierExpressionNode>(expr); id && id->identifier)
-        return id->identifier->name;
-    if (auto id = std::dynamic_pointer_cast<Identifier>(expr))
-        return id->name;
-    return std::nullopt;
+      if (auto id = std::dynamic_pointer_cast<IdentifierExpressionNode>(expr); id && id->identifier) {
+            return id->identifier->name;
+      }
+      if (auto id = std::dynamic_pointer_cast<Identifier>(expr)) {
+            return id->name;
+      }
+      return std::nullopt;
 }
 
 // An auto-generated register/loop/closure name (v3, uv_0, arg1, a2, i_4, anon_5_0)
 // is a runtime value, never a type. Using it as a type annotation produces invalid
 // Luau (`local x: v2 = ...`), so callers must reject these as type names.
 static bool IsGeneratedName(const std::string &name) {
-    auto digitsFrom = [&](size_t i) { return i < name.size() && std::isdigit(static_cast<unsigned char>(name[i])); };
-    if (name.rfind("uv_", 0) == 0)
-        return digitsFrom(3);
-    if (name.rfind("arg", 0) == 0)
-        return digitsFrom(3);
-    if (name.rfind("anon_", 0) == 0)
-        return digitsFrom(5);
-    if (name.rfind("i_", 0) == 0)
-        return digitsFrom(2);
-    if (name.size() >= 2 && (name[0] == 'v' || name[0] == 'a')) {
-        for (size_t i = 1; i < name.size(); ++i)
-            if (!std::isdigit(static_cast<unsigned char>(name[i])))
-                return false;
-        return true;
-    }
-    return false;
+      auto digitsFrom = [&](size_t i) { return i < name.size() && std::isdigit(static_cast<unsigned char>(name[i])); };
+      if (name.rfind("uv_", 0) == 0) {
+            return digitsFrom(3);
+      }
+      if (name.rfind("arg", 0) == 0) {
+            return digitsFrom(3);
+      }
+      if (name.rfind("anon_", 0) == 0) {
+            return digitsFrom(5);
+      }
+      if (name.rfind("i_", 0) == 0) {
+            return digitsFrom(2);
+      }
+      if (name.size() >= 2 && (name[0] == 'v' || name[0] == 'a')) {
+            for (size_t i = 1; i < name.size(); ++i) {
+                  if (!std::isdigit(static_cast<unsigned char>(name[i]))) {
+                        return false;
+                  }
+            }
+            return true;
+      }
+      return false;
 }
 
 // A derived name equal to a Luau keyword would produce uncompilable Luau if used verbatim as a
 // local. Roblox instances/fields can legally be named with these (a child literally called "end"),
 // so guard against it.
 static bool IsReservedLuauKeyword(const std::string &name) {
-    static const std::set<std::string> kKeywords = {"and",   "break", "do",     "else",  "elseif", "end",   "false", "for",
-                                                    "function", "if",    "in",     "local", "nil",    "not",   "or",    "repeat",
-                                                    "return", "then",  "true",   "until", "while"};
-    return kKeywords.contains(name);
+
+      // static const std::set<std::string> kKeywords =
+      //       {"and", "break", "do", "else", "elseif", "end", "false", "for",
+      //             "function", "if", "in", "local", "nil", "not", "or", "repeat",
+      //             "return", "then", "true", "until", "while"};
+      
+      return RESERVED_KEYWORDS.contains(name);
 }
 
 // Lowercase only the first character: `CFrame` -> `cFrame`, `Vector3` -> `vector3`. Turns a
 // datatype name into the conventional spelling of a value of that type.
 static std::string LowerFirstChar(std::string name) {
-    if (!name.empty())
-        name[0] = static_cast<char>(std::tolower(static_cast<unsigned char>(name[0])));
-    return name;
+      if (!name.empty()) {
+            name[0] = static_cast<char>(std::tolower(static_cast<unsigned char>(name[0])));
+      }
+      return name;
 }
 
 // Known Roblox datatype libraries whose constructors (`.new`, `.fromRGB`, `.Angles`, ...) yield a
@@ -62,125 +86,153 @@ static std::string LowerFirstChar(std::string name) {
 // `Instance` and `Enum` are deliberately excluded: `Instance.new("Part")` is better named/typed
 // after its class argument, which the caller handles separately.
 static std::optional<std::string> DatatypeConstructor(const std::string &library, const std::string &method) {
-    static const std::set<std::string> kLibraries = {
-        "CFrame",   "Vector3",     "Vector2",      "Vector3int16",   "Vector2int16",   "Color3",
-        "UDim",     "UDim2",       "Rect",         "Region3",        "Region3int16",   "Ray",
-        "NumberRange", "NumberSequence", "ColorSequence", "NumberSequenceKeypoint", "ColorSequenceKeypoint",
-        "PhysicalProperties", "BrickColor", "TweenInfo", "Random",   "DateTime",       "RaycastParams",
-        "OverlapParams", "Font",   "PathWaypoint"};
-    static const std::set<std::string> kConstructors = {
-        "new",       "fromRGB",          "fromHSV",           "fromHex",        "fromName",
-        "Angles",    "fromEulerAnglesXYZ", "fromEulerAnglesYXZ", "fromAxisAngle", "fromMatrix",
-        "lookAt",    "fromOrientation",  "fromOffset",        "fromScale",      "fromNormalId",
-        "fromUnixTimestamp", "fromUnixTimestampMillis", "fromIsoDate", "fromLocalTime", "fromUniversalTime",
-        "now"};
-    if (kLibraries.contains(library) && kConstructors.contains(method))
-        return library;
-    return std::nullopt;
+      
+      
+      static const std::set<std::string> kLibraries = {
+            "CFrame",   "Vector3",     "Vector2",      "Vector3int16",   "Vector2int16",   "Color3",
+            "UDim",     "UDim2",       "Rect",         "Region3",        "Region3int16",   "Ray",
+            "NumberRange", "NumberSequence", "ColorSequence", "NumberSequenceKeypoint", "ColorSequenceKeypoint",
+            "PhysicalProperties", "BrickColor", "TweenInfo", "Random",   "DateTime",       "RaycastParams",
+            "OverlapParams", "Font",   "PathWaypoint"
+      };
+      static const std::set<std::string> kConstructors = {
+            "new",       "fromRGB",          "fromHSV",           "fromHex",        "fromName",
+            "Angles",    "fromEulerAnglesXYZ", "fromEulerAnglesYXZ", "fromAxisAngle", "fromMatrix",
+            "lookAt",    "fromOrientation",  "fromOffset",        "fromScale",      "fromNormalId",
+            "fromUnixTimestamp", "fromUnixTimestampMillis", "fromIsoDate", "fromLocalTime", "fromUniversalTime",
+            "now"
+      };
+
+      if (kLibraries.contains(library) && kConstructors.contains(method)) {
+            return library;
+      }
+      return std::nullopt;
 }
 
 std::optional<std::string> RobloxTypeInferer::StringLiteralValue(const std::shared_ptr<Expression> &expr) {
-    if (auto str = std::dynamic_pointer_cast<StringLiteralNode>(expr))
-        return str->value;
-    return std::nullopt;
+      if (auto str = std::dynamic_pointer_cast<StringLiteralNode>(expr)) {
+            return str->value;
+      }
+      return std::nullopt;
 }
 
 std::optional<std::string> RobloxTypeInferer::MemberKeyName(const std::shared_ptr<Expression> &expr) {
-    if (auto str = std::dynamic_pointer_cast<StringLiteralNode>(expr))
-        return str->value;
-    return IdentifierName(expr);
+      if (auto str = std::dynamic_pointer_cast<StringLiteralNode>(expr)) {
+            return str->value;
+      }
+      return IdentifierName(expr);
 }
 
 std::optional<std::string> RobloxTypeInferer::ClassArgument(const std::vector<std::shared_ptr<Expression>> &args, size_t index) {
-    if (args.size() <= index)
-        return std::nullopt;
-    return StringLiteralValue(args[index]);
+      if (args.size() <= index) {
+            return std::nullopt;
+      }
+      return StringLiteralValue(args[index]);
 }
 
 std::optional<std::string>
 RobloxTypeInferer::CallReturnType(const std::string &methodName, const std::vector<std::shared_ptr<Expression>> &args, size_t classArgIndex) {
-    if (methodName == "FindFirstChild" || methodName == "WaitForChild" || methodName == "FindFirstAncestor")
-        return "Instance";
-    if (methodName == "FindFirstChildOfClass" || methodName == "FindFirstChildWhichIsA" || methodName == "GetService" ||
-        methodName == "FindFirstAncestorOfClass" || methodName == "FindFirstAncestorWhichIsA")
-        return ClassArgument(args, classArgIndex).value_or("Instance");
 
-    if (methodName == "lower" || methodName == "upper" || methodName == "rep" || methodName == "reverse")
-        return "string";
-    if (methodName == "format" || methodName == "char" || methodName == "pack")
-        return "string";
-    if (methodName == "split")
-        return "{string}";
-    if (methodName == "byte" || methodName == "len" || methodName == "packsize")
-        return "number";
-    if (methodName == "find")
-        return "number";
-    if (methodName == "match" || methodName == "sub")
-        return "string";
+      if (methodName == "FindFirstChild" || methodName == "WaitForChild" || methodName == "FindFirstAncestor") {
+            return "Instance";
+      }
+      if (
+            methodName == "FindFirstChildOfClass" || methodName == "FindFirstChildWhichIsA" || methodName == "GetService" ||
+            methodName == "FindFirstAncestorOfClass" || methodName == "FindFirstAncestorWhichIsA"
+      ) {
+            return ClassArgument(args, classArgIndex).value_or("Instance");
+      }
+      if (methodName == "lower" || methodName == "upper" || methodName == "rep" || methodName == "reverse") {
+            return "string";
+      }
+      if (methodName == "format" || methodName == "char" || methodName == "pack") {
+            return "string";
+      }
+      if (methodName == "split") {
+            return "{string}";
+      }
+      if (methodName == "byte" || methodName == "len" || methodName == "packsize") {
+            return "number";
+      }
+      if (methodName == "find") {
+            return "number";
+      }
+      if (methodName == "match" || methodName == "sub") {
+            return "string";
+      }
+      if (methodName == "abs" || methodName == "ceil" || methodName == "floor" || methodName == "round" || methodName == "sqrt") {
+            return "number";
+      }
+      if (methodName == "sin" || methodName == "cos" || methodName == "tan" || methodName == "asin" || methodName == "acos") {
+            return "number";
+      }
+      if (methodName == "atan" || methodName == "atan2" || methodName == "log" || methodName == "log10" || methodName == "exp") {
+            return "number";
+      }
+      if (methodName == "min" || methodName == "max" || methodName == "pow" || methodName == "sign" || methodName == "clamp") {
+            return "number";
+      }
+      if (methodName == "rad" || methodName == "deg" || methodName == "noise" || methodName == "ldexp") {
+            return "number";
+      }
+      if (methodName == "random") {
+            return "number";
+      }
+      if (methodName == "insert" || methodName == "remove" || methodName == "sort" || methodName == "clear") {
+            return std::nullopt;
+      }
+      if (methodName == "create" || methodName == "freeze" || methodName == "clone" || methodName == "pack") {
+            return "{ [any]: any }";
+      }
+      if (methodName == "find") {
+            return "number";
+      }
+      if (methodName == "keys" || methodName == "values") {
+            return "{ [any]: any }";
+      }
+      if (methodName == "concat") {
+            return "string";
+      }
+      if (methodName == "maxn" || methodName == "getn") {
+            return "number";
+      }
+      if (methodName == "clock" || methodName == "time" || methodName == "difftime")
+            return "number";
+      if (methodName == "GetServerTimeNow" || methodName == "GetServerTimeNowAsync")
+            return "number";
+      if (methodName == "date")
+            return "string";
 
-    if (methodName == "abs" || methodName == "ceil" || methodName == "floor" || methodName == "round" || methodName == "sqrt")
-        return "number";
-    if (methodName == "sin" || methodName == "cos" || methodName == "tan" || methodName == "asin" || methodName == "acos")
-        return "number";
-    if (methodName == "atan" || methodName == "atan2" || methodName == "log" || methodName == "log10" || methodName == "exp")
-        return "number";
-    if (methodName == "min" || methodName == "max" || methodName == "pow" || methodName == "sign" || methodName == "clamp")
-        return "number";
-    if (methodName == "rad" || methodName == "deg" || methodName == "noise" || methodName == "ldexp")
-        return "number";
-    if (methodName == "random")
-        return "number";
+      if (methodName == "create" || methodName == "wrap")
+            return "thread";
+      if (methodName == "resume")
+            return "boolean";
+      if (methodName == "status" || methodName == "running")
+            return "string";
+      if (methodName == "isyieldable")
+            return "boolean";
 
-    if (methodName == "insert" || methodName == "remove" || methodName == "sort" || methodName == "clear")
-        return std::nullopt;
-    if (methodName == "create" || methodName == "freeze" || methodName == "clone" || methodName == "pack")
-        return "{ [any]: any }";
-    if (methodName == "find")
-        return "number";
-    if (methodName == "keys" || methodName == "values")
-        return "{ [any]: any }";
-    if (methodName == "concat")
-        return "string";
-    if (methodName == "maxn" || methodName == "getn")
-        return "number";
+      if (methodName == "band" || methodName == "bor" || methodName == "bxor" || methodName == "bnot")
+            return "number";
+      if (methodName == "lshift" || methodName == "rshift" || methodName == "arshift")
+            return "number";
+      if (methodName == "lrotate" || methodName == "rrotate" || methodName == "extract" || methodName == "replace")
+            return "number";
+      if (methodName == "countlz" || methodName == "countrz")
+            return "number";
+      if (methodName == "btest")
+            return "boolean";
 
-    if (methodName == "clock" || methodName == "time" || methodName == "difftime")
-        return "number";
-    if (methodName == "GetServerTimeNow" || methodName == "GetServerTimeNowAsync")
-        return "number";
-    if (methodName == "date")
-        return "string";
+      if (methodName == "len" || methodName == "create")
+            return "number";
+      if (methodName == "tostring")
+            return "string";
+      if (methodName == "fromstring")
+            return "buffer";
+      if (methodName == "read")
+            return "number";
 
-    if (methodName == "create" || methodName == "wrap")
-        return "thread";
-    if (methodName == "resume")
-        return "boolean";
-    if (methodName == "status" || methodName == "running")
-        return "string";
-    if (methodName == "isyieldable")
-        return "boolean";
-
-    if (methodName == "band" || methodName == "bor" || methodName == "bxor" || methodName == "bnot")
-        return "number";
-    if (methodName == "lshift" || methodName == "rshift" || methodName == "arshift")
-        return "number";
-    if (methodName == "lrotate" || methodName == "rrotate" || methodName == "extract" || methodName == "replace")
-        return "number";
-    if (methodName == "countlz" || methodName == "countrz")
-        return "number";
-    if (methodName == "btest")
-        return "boolean";
-
-    if (methodName == "len" || methodName == "create")
-        return "number";
-    if (methodName == "tostring")
-        return "string";
-    if (methodName == "fromstring")
-        return "buffer";
-    if (methodName == "read")
-        return "number";
-
-    return std::nullopt;
+      return std::nullopt;
 }
 
 std::optional<std::string>
@@ -308,140 +360,185 @@ void RobloxTypeInferer::AnnotateCallReturn(NameCallExpressionNode *call, const s
 }
 
 std::optional<std::string> RobloxTypeInferer::ExpressionType(const std::shared_ptr<Expression> &expr, const TypeEnv &env) {
-    if (!expr)
-        return std::nullopt;
+      if (!expr) {
+            return std::nullopt;
+      }
 
-    if (auto literalType = LiteralType(expr))
-        return literalType;
+      if (auto literalType = LiteralType(expr)) {
+            return literalType;
+      }
 
-    if (auto name = IdentifierName(expr)) {
-        if (*name == "game")
-            return "DataModel";
-        if (*name == "workspace")
-            return "Workspace";
-        if (*name == "script")
-            return "LuaSourceContainer";
-        if (env.contains(*name))
-            return env.at(*name);
-    }
+      if (auto name = IdentifierName(expr)) {
+            if (*name == "game") {
+                  return "DataModel";
+            }
+            if (*name == "workspace") {
+                  return "Workspace";
+            }
+            if (*name == "script") {
+                  return "LuaSourceContainer";
+            }
+            if (env.contains(*name)) {
+                  return env.at(*name);
+            }
+      }
 
-    if (auto member = std::dynamic_pointer_cast<MemberExpressionNode>(expr)) {
-        auto tableName = IdentifierName(member->table);
-        auto keyName = MemberKeyName(member->key);
-        if (tableName && keyName) {
-            if (*tableName == "script" && *keyName == "Parent")
-                return "Instance";
-            if (*tableName == "game" && *keyName == "Workspace")
-                return "Workspace";
-        }
-    }
+      if (auto member = std::dynamic_pointer_cast<MemberExpressionNode>(expr)) {
+            
+            auto tableName    = IdentifierName(member->table);
+            auto keyName      = MemberKeyName(member->key);
+
+            if (tableName && keyName) {
+                  if (*tableName == "script" && *keyName == "Parent") {
+                        return "Instance";
+                  }
+                  if (*tableName == "game" && *keyName == "Workspace") {
+                        return "Workspace";
+                  }
+            }
+      }
 
     if (auto nameCall = std::dynamic_pointer_cast<NameCallExpressionNode>(expr)) {
-        if (auto methodName = IdentifierName(nameCall->callWhat)) {
-            if (auto result = CallReturnType(*methodName, nameCall->arguments, 0))
-                return result;
-            if (auto receiverType = ExpressionType(nameCall->calledOn, env))
-                if (auto result = LibraryReceiverMethodType(*receiverType, *methodName))
-                    return result;
-        }
+            if (auto methodName = IdentifierName(nameCall->callWhat)) {
+
+                  if (auto result = CallReturnType(*methodName, nameCall->arguments, 0)) {
+                        return result;
+                  }
+
+                  if (auto receiverType = ExpressionType(nameCall->calledOn, env)) {
+
+                        if (auto result = LibraryReceiverMethodType(*receiverType, *methodName)) {
+                              return result;
+                        }
+                  }
+            }
     }
 
-    if (auto call = std::dynamic_pointer_cast<CallExpressionNode>(expr)) {
-        if (auto member = std::dynamic_pointer_cast<MemberExpressionNode>(call->callee)) {
-            auto libName = IdentifierName(member->table);
-            if (auto methodName = MemberKeyName(member->key)) {
-                // `Instance.new("Part")` is typed as its class; other `<Datatype>.new(...)` as the datatype.
-                if (libName) {
-                    if (*libName == "Instance" && *methodName == "new")
-                        if (auto cls = ClassArgument(call->arguments, 0))
-                            return cls;
-                    if (auto dt = DatatypeConstructor(*libName, *methodName))
-                        return *dt;
-                }
-                if (auto result = CallReturnType(*methodName, call->arguments, 1))
-                    return result;
+      if (auto call = std::dynamic_pointer_cast<CallExpressionNode>(expr)) {
+
+
+
+            if (auto member = std::dynamic_pointer_cast<MemberExpressionNode>(call->callee)) {
+
+                  auto libName = IdentifierName(member->table);
+                  if (auto methodName = MemberKeyName(member->key)) {
+                        // `Instance.new("Part")` is typed as its class; other `<Datatype>.new(...)` as the datatype.
+                        if (libName) {
+                              if (*libName == "Instance" && *methodName == "new") {
+                                    if (auto cls = ClassArgument(call->arguments, 0)) {
+                                          return cls;
+                                    }
+                              }
+                              if (auto dt = DatatypeConstructor(*libName, *methodName)) {
+                                    return *dt;
+                              }
+                        }
+                        if (auto result = CallReturnType(*methodName, call->arguments, 1)) {
+                              return result;
+                        }
+                  }
             }
-        }
-        if (auto globalId = std::dynamic_pointer_cast<IdentifierExpressionNode>(call->callee)) {
-            if (auto gname = IdentifierName(globalId))
-                if (auto result = GlobalFunctionType(*gname, call->arguments))
-                    return result;
-        }
-    }
+            if (auto globalId = std::dynamic_pointer_cast<IdentifierExpressionNode>(call->callee)) {
+                  if (auto gname = IdentifierName(globalId)) {
+                        if (auto result = GlobalFunctionType(*gname, call->arguments)) {
+                              return result;
+                        }
+                  }
+            }
+      }
 
     return std::nullopt;
 }
 
 std::optional<std::string> RobloxTypeInferer::ExpressionAutoName(const std::shared_ptr<Expression> &expr) {
-    if (!expr)
-        return std::nullopt;
+      if (!expr) {
+            return std::nullopt;
+      }
 
-    if (auto nameCall = std::dynamic_pointer_cast<NameCallExpressionNode>(expr)) {
-        if (auto methodName = IdentifierName(nameCall->callWhat)) {
-            if (auto result = CallAutoName(*methodName, nameCall->arguments, 0))
-                return result;
-            // `workspace:GetServerTimeNow()` and friends → timestamp.
-            if (*methodName == "GetServerTimeNow" || *methodName == "GetServerTimeNowAsync")
-                return std::string("timestamp");
-        }
-    }
+      if (auto nameCall = std::dynamic_pointer_cast<NameCallExpressionNode>(expr)) {
+            if (auto methodName = IdentifierName(nameCall->callWhat)) {
+                  if (auto result = CallAutoName(*methodName, nameCall->arguments, 0)) {
+                        return result;
+                  }
 
-    if (auto call = std::dynamic_pointer_cast<CallExpressionNode>(expr)) {
-        if (auto member = std::dynamic_pointer_cast<MemberExpressionNode>(call->callee)) {
-            auto tableName = IdentifierName(member->table);
-            if (auto methodName = MemberKeyName(member->key)) {
-                if (auto result = CallAutoName(*methodName, call->arguments, 1))
-                    return result;
-                // `Instance.new("ClassName")` → ClassName.
-                if (*methodName == "new" && tableName && *tableName == "Instance")
-                    if (auto cls = ClassArgument(call->arguments, 0))
-                        return cls;
-                if (tableName) {
-                    // `CFrame.new(...)` → cFrame, `Vector3.new(...)` → vector3, etc.
-                    if (auto dt = DatatypeConstructor(*tableName, *methodName))
-                        return LowerFirstChar(*dt);
-                    // `os.clock()` / `os.time()` → timestamp.
-                    if (*tableName == "os" && (*methodName == "clock" || *methodName == "time"))
+                  // `workspace:GetServerTimeNow()` and friends → timestamp.
+                  if (*methodName == "GetServerTimeNow" || *methodName == "GetServerTimeNowAsync") {
                         return std::string("timestamp");
-                }
+                  }
             }
-        }
-        if (auto globalId = std::dynamic_pointer_cast<IdentifierExpressionNode>(call->callee)) {
-            if (auto gname = IdentifierName(globalId))
-                if (auto result = GlobalFunctionAutoName(*gname, call->arguments))
-                    return result;
-        }
-    }
+      }
+
+      if (auto call = std::dynamic_pointer_cast<CallExpressionNode>(expr)) {
+            if (auto member = std::dynamic_pointer_cast<MemberExpressionNode>(call->callee)) {
+                  auto tableName = IdentifierName(member->table);
+                  if (auto methodName = MemberKeyName(member->key)) {
+                        if (auto result = CallAutoName(*methodName, call->arguments, 1))
+                              return result;
+                        // `Instance.new("ClassName")` → ClassName.
+                        if (*methodName == "new" && tableName && *tableName == "Instance") {
+                              if (auto cls = ClassArgument(call->arguments, 0)) {
+                                    return cls;
+                              }
+                        }
+                        if (tableName) {
+                              // `CFrame.new(...)` → cFrame, `Vector3.new(...)` → vector3, etc.
+                              if (auto dt = DatatypeConstructor(*tableName, *methodName)) {
+                                    return LowerFirstChar(*dt);
+                              }
+                              // `os.clock()` / `os.time()` → timestamp.
+                              if (*tableName == "os" && (*methodName == "clock" || *methodName == "time")) {
+                                    return std::string("timestamp");
+                              }
+                        }
+                  }
+            }
+
+            if (auto globalId = std::dynamic_pointer_cast<IdentifierExpressionNode>(call->callee)) {
+                  if (auto gname = IdentifierName(globalId)) {
+                        if (auto result = GlobalFunctionAutoName(*gname, call->arguments)) {
+                              return result;
+                        }
+                  }
+            }
+      }
 
     // Field access: `Players.LocalPlayer` / `humanoid.RootPart` → the accessed field name. This is the
     // most common shape of a named value in decompiled Roblox code, so naming the local after the field
     // it reads recovers the original intent in the vast majority of cases.
-    if (auto member = std::dynamic_pointer_cast<MemberExpressionNode>(expr)) {
-        if (member->table != nullptr)
-            if (auto keyName = MemberKeyName(member->key))
-                return keyName;
-    }
+      if (auto member = std::dynamic_pointer_cast<MemberExpressionNode>(expr)) {
+            if (member->table != nullptr) {
+                  if (auto keyName = MemberKeyName(member->key)) {
+                        return keyName;
+                  }
+            }
+      }
 
     // Indexed access with a constant string key: `t["LocalPlayer"]` → LocalPlayer.
-    if (auto index = std::dynamic_pointer_cast<IndexExpressionNode>(expr)) {
-        if (auto keyStr = StringLiteralValue(index->right))
-            return keyStr;
-    }
+      if (auto index = std::dynamic_pointer_cast<IndexExpressionNode>(expr)) {
+            if (auto keyStr = StringLiteralValue(index->right)) {
+                  return keyStr;
+            }
+      }
 
     // Bare literals get a short, type-coded base name (always numbered downstream: n1, s1, t1, ...),
     // mirroring conventional decompiler output for values whose type is obvious from the literal.
-    if (std::dynamic_pointer_cast<VectorNode>(expr))
-        return std::string("vector3");
-    if (std::dynamic_pointer_cast<NumberLiteralNode>(expr) || std::dynamic_pointer_cast<IntegerLiteralNode>(expr))
-        return std::string("n");
-    if (std::dynamic_pointer_cast<StringLiteralNode>(expr))
-        return std::string("s");
-    if (std::dynamic_pointer_cast<BooleanLiteralNode>(expr))
-        return std::string("b");
-    if (std::dynamic_pointer_cast<TableLiteralNode>(expr))
-        return std::string("t");
+      if (std::dynamic_pointer_cast<VectorNode>(expr)) {
+            return std::string("vector3");
+      }
+      if (std::dynamic_pointer_cast<NumberLiteralNode>(expr) || std::dynamic_pointer_cast<IntegerLiteralNode>(expr)) {
+            return std::string("n");
+      }
+      if (std::dynamic_pointer_cast<StringLiteralNode>(expr)) {
+            return std::string("s");
+      }
+      if (std::dynamic_pointer_cast<BooleanLiteralNode>(expr)) {
+            return std::string("b");
+      }
+      if (std::dynamic_pointer_cast<TableLiteralNode>(expr)) {
+            return std::string("t");
+      }
 
-    return std::nullopt;
+      return std::nullopt;
 }
 
 std::string RobloxTypeInferer::ResolveAutoName(const std::string &currentName, const std::string &wantedName) {

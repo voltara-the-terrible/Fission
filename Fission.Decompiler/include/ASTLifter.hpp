@@ -16,37 +16,37 @@
 #include <vector>
 
 struct ASTFunction {
-    AnalyzedFunction *backingFunction = nullptr; // not owned by ASTFunction
-    std::vector<std::shared_ptr<Statement>> statements;
+        AnalyzedFunction *backingFunction = nullptr; // not owned by ASTFunction
+        std::vector<std::shared_ptr<Statement>> statements;
 
-    std::vector<ASTFunction> subFunctions;
+        std::vector<ASTFunction> subFunctions;
 };
 
 class ASTLifter {
-  public:
-    std::shared_ptr<Expression> InvertCondition(const std::shared_ptr<Expression> &cond);
-    explicit ASTLifter();
+    public:
+        std::shared_ptr<Expression> InvertCondition(const std::shared_ptr<Expression> &cond);
+        explicit ASTLifter();
 
-    DecompilerFlags m_flags;
-    ASTFunction Lift(AnalyzedFunction &analyzedFunction, DecompilerFlags flags);
-    std::shared_ptr<Expression> LiftCondition(const LiftedInstruction *inst);
+        DecompilerFlags m_flags;
+        ASTFunction Lift(AnalyzedFunction &analyzedFunction, DecompilerFlags flags);
+        std::shared_ptr<Expression> LiftCondition(const LiftedInstruction *inst);
 
-    std::unordered_set<int32_t> m_definedRegisters;
-    std::unordered_set<int32_t> m_pinnedRegisters;
+        std::unordered_set<int32_t> m_definedRegisters;
+        std::unordered_set<int32_t> m_pinnedRegisters;
 
-    std::unordered_set<int32_t> m_processedInstructions;
+        std::unordered_set<int32_t> m_processedInstructions;
 
-    struct PinnedRegisterScope {
-        ASTLifter *m_lpLifter;
-        int32_t dwReg;
+        struct PinnedRegisterScope {
+            ASTLifter *m_lpLifter;
+            int32_t dwReg;
 
-        PinnedRegisterScope(ASTLifter *lifter, int32_t reg) : m_lpLifter(lifter), dwReg(reg) { m_lpLifter->m_pinnedRegisters.insert(reg); }
+            PinnedRegisterScope(ASTLifter *lifter, int32_t reg) : m_lpLifter(lifter), dwReg(reg) { m_lpLifter->m_pinnedRegisters.insert(reg); }
 
-        ~PinnedRegisterScope() { m_lpLifter->m_pinnedRegisters.erase(dwReg); }
+            ~PinnedRegisterScope() { m_lpLifter->m_pinnedRegisters.erase(dwReg); }
 
-        PinnedRegisterScope(const PinnedRegisterScope &) = delete;
-        PinnedRegisterScope &operator=(const PinnedRegisterScope &) = delete;
-    };
+            PinnedRegisterScope(const PinnedRegisterScope &) = delete;
+            PinnedRegisterScope &operator=(const PinnedRegisterScope &) = delete;
+        };
 
     std::set<SSARef> m_phiConsumers;
 
