@@ -62,6 +62,19 @@ class ASTLifter {
     // `if .. elseif .. else` expressions instead of the default `a and A or b and B or C` form.
     bool m_useIfElseExpressions = false;
 
+    // When set, each lifted statement is tagged with its source `Line/Register/OpCode` (emitted by
+    // the generator as a leading `--[[ ... ]]` comment).
+    bool m_emitDebugInfo = false;
+
+    // When set, recover `do ... end` blocks that declare no local (only reassign outer vars) from
+    // source line gaps (needs line debug info). Opt-in: blank lines/comments also leave gaps.
+    bool m_recoverDoEndFromLines = false;
+
+    // DebugInfo helpers (used by both LiftBlockInstructions and the value-materialisation detectors).
+    int LineForPc(int pc); // source line for a bytecode PC (== lifted instructionIndex), -1 if unknown
+    std::pair<int, int> RegisterSpanOfBlocks(const std::vector<uint32_t> &blockIds); // {minReg, maxReg} over their instructions
+    void TagDebugAnnotation(const std::shared_ptr<Statement> &stmt, int lineInstr, int minReg, int maxReg, std::string_view op);
+
   private:
     AnalyzedFunction *m_currentFunction = nullptr;
 
@@ -92,9 +105,21 @@ class ASTLifter {
         int start;  // first instruction index in the scope
         int end;    // last instruction index in the scope
         std::unordered_set<int> localRegs; // registers whose whole live range is inside the scope
+        // recovered from line gaps (RecoverDoEndFromLineInfo): the block only reassigns outer vars, so
+        // its locals are hoisted (declared before the block) rather than re-localised inside it.
+        bool fromLineGap = false;
     };
     std::vector<DoScopeInterval> ComputeDoScopes(const BasicBlock &block, const std::vector<std::pair<int, size_t>> &stmtMarks,
                                                  const std::vector<std::shared_ptr<Statement>> &statements);
+    // Exact do...end scopes from `locvars` debug info (present when bytecode is compiled with
+    // debugLevel >= 2). A local whose scope ends before the block's end is block-scoped (a do-block);
+    // locals sharing an end PC belong to the same block. Authoritative — no register heuristic needed.
+    std::vector<DoScopeInterval> ComputeDoScopesFromLocvars(int lo, int hi);
+    // Opt-in heuristic (RecoverDoEndFromLineInfo): recover do...end blocks that declare no local from
+    // source line gaps. Only returns gap-bracketed runs whose defined registers are all block-local
+    // (don't escape the run), so wrapping + re-localising them is semantics-preserving.
+    std::vector<DoScopeInterval> ComputeDoScopesFromLineGaps(const BasicBlock &block, const std::vector<std::pair<int, size_t>> &stmtMarks,
+                                                             const std::vector<std::shared_ptr<Statement>> &statements);
     std::vector<std::shared_ptr<Statement>> GroupDoScopes(const BasicBlock &block, std::vector<std::shared_ptr<Statement>> statements,
                                                           const std::vector<std::pair<int, size_t>> &stmtMarks);
     bool CanReach(uint32_t start, uint32_t target, uint32_t stopBlock, const std::set<uint32_t> &visitedScopes);

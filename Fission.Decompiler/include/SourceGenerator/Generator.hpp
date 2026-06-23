@@ -112,10 +112,22 @@ class SourceGenerator : public Visitor {
         cur->elseExpr->Accept(this);
     }
 
+    // trailing `--[[ Line/Register/OpCode ]]` comment for a statement, when DebugInfo tagged it.
+    // The statement has just been emitted and ends with a newline; overwrite that newline so the
+    // comment sits at the end of the same line.
+    void EmitDebugAnnotation(ASTNode *node) {
+        if (!node || !node->debugAnnotation)
+            return;
+        buffer.seekp(-1, std::ios_base::end);
+        buffer << " --[[ " << *node->debugAnnotation << " ]]\n";
+    }
+
     void Visit(RootNode *lpNode) override {
         (void)lpNode;
-        for (const auto &body : lpNode->programBody)
+        for (const auto &body : lpNode->programBody) {
             body->Accept(this);
+            EmitDebugAnnotation(body.get());
+        }
     }
 
     void Visit(Identifier *lpNode) override { buffer << lpNode->name; }
@@ -358,6 +370,7 @@ class SourceGenerator : public Visitor {
         (void)lpNode;
         for (const auto &node : lpNode->body) {
             node->Accept(this);
+            EmitDebugAnnotation(node.get());
         }
     }
 

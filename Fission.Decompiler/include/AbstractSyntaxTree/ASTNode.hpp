@@ -68,6 +68,9 @@ class ASTNode {
   public:
     virtual ~ASTNode() = default;
     ASTNodeKind nodeKind = ASTNodeKind::Unknown;
+    // Optional source annotation (Line/Register/OpCode), set when DebugInfo is requested and emitted
+    // by the generator as a leading `--[[ ... ]]` comment.
+    std::optional<std::string> debugAnnotation = std::nullopt;
     virtual void Accept(Visitor *visitor) { (void)visitor; }
 };
 

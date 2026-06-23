@@ -34,7 +34,14 @@ enum class DecompilerFlags : uint16_t {
     OmitFissionComments = 1 << 9,
     // render value-materialisation diamonds/chains as `if c then A else B` / `if .. elseif .. else`
     // expressions instead of the default `a and A or b and B or C` short-circuit form.
-    UseIfElseExpressions = 1 << 10
+    UseIfElseExpressions = 1 << 10,
+    // annotate each lifted statement with its source `--[[ Line: .., Register: .., OpCode: .. ]]`.
+    DebugInfo = 1 << 11,
+    // heuristically recover `do ... end` blocks that declare no local (only reassign outer vars) from
+    // source line gaps (the `do`/`end` lines emit no instructions). Needs line debug info; since blank
+    // lines/comments also leave gaps it can over-wrap, so it is opt-in. Only wraps line-gap runs whose
+    // defined registers do not escape (semantics-preserving).
+    RecoverDoEndFromLineInfo = 1 << 12
 };
 
 constexpr DecompilerFlags operator|(DecompilerFlags lhs, DecompilerFlags rhs) {

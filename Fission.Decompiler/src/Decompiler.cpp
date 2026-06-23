@@ -6,6 +6,7 @@
 #include "AbstractSyntaxTree/Nodes/CommentNode.hpp"
 #include "Analysis/RobloxTypeInferer.hpp"
 #include "Rewriters/DeadLocalEliminator.hpp"
+#include "Rewriters/DoBlockLocalRenamer.hpp"
 #include "Rewriters/IfChainSimplifier.hpp"
 #include "Rewriters/ShortCircuitFolder.hpp"
 #include "SafetyGuard.hpp"
@@ -45,6 +46,13 @@ void PrintFunctionOntoStream(std::stringstream &stream, int indentationLevel, co
 
     stream << GetIndentation(indentationLevel) << "/* Function Name: '" << rawFunc->name << "' */\n";
     stream << GetIndentation(indentationLevel) << "/* Basic Blocks: " << analyzedFunc.basicBlocks.size() << " */\n";
+
+    if (rawFunc->lpDeserialized && !rawFunc->lpDeserialized->locvars.empty()) {
+        stream << GetIndentation(indentationLevel) << "/* Local Variables (debug info): */\n";
+        for (const auto &lv : rawFunc->lpDeserialized->locvars)
+            stream << GetIndentation(indentationLevel + 2) << "/* '" << lv.varname << "' reg=R" << static_cast<int>(lv.reg) << " scope=[" << lv.startpc
+                   << ", " << lv.endpc << ") */\n";
+    }
 
     for (const auto &block : analyzedFunc.basicBlocks) {
         stream << "\n";
@@ -176,6 +184,10 @@ static std::string FormatDecompilerOptions(DecompilerFlags flags) {
         enabled.emplace_back("OmitFissionComments");
     if ((flags & DecompilerFlags::UseIfElseExpressions) == DecompilerFlags::UseIfElseExpressions)
         enabled.emplace_back("UseIfElseExpressions");
+    if ((flags & DecompilerFlags::DebugInfo) == DecompilerFlags::DebugInfo)
+        enabled.emplace_back("DebugInfo");
+    if ((flags & DecompilerFlags::RecoverDoEndFromLineInfo) == DecompilerFlags::RecoverDoEndFromLineInfo)
+        enabled.emplace_back("RecoverDoEndFromLineInfo");
 
     if (enabled.empty())
         return "None";
@@ -706,6 +718,8 @@ DecompilationResult Decompiler::CommonDecompilerEntryImpl(const std::string &byt
 
     const auto astStart = std::chrono::steady_clock::now();
     ASTLifter.m_useIfElseExpressions = (flags & DecompilerFlags::UseIfElseExpressions) == DecompilerFlags::UseIfElseExpressions;
+    ASTLifter.m_emitDebugInfo = (flags & DecompilerFlags::DebugInfo) == DecompilerFlags::DebugInfo;
+    ASTLifter.m_recoverDoEndFromLines = (flags & DecompilerFlags::RecoverDoEndFromLineInfo) == DecompilerFlags::RecoverDoEndFromLineInfo;
     auto liftedAST = ASTLifter.Lift(controlFlowAnalyzedFunction);
     AddDecompilerOptionsToHeader(liftedAST, flags);
 
@@ -736,6 +750,10 @@ DecompilationResult Decompiler::CommonDecompilerEntryImpl(const std::string &byt
     if (inferRobloxTypes || autoNameVariables)
         RobloxTypeInferer{}.Infer(liftedAST, inferRobloxTypes, autoNameVariables);
     const auto robloxPropagationEnd = std::chrono::steady_clock::now();
+
+    // Give do-block locals distinct, non-shadowing names (the register-based naming reuses `vN`
+    // across sibling do-blocks and shadows outer locals).
+    DoBlockLocalRenamer{}.Run(liftedAST.statements);
     const auto astEnd = std::chrono::steady_clock::now();
 
     RootNode root{liftedAST.statements};
