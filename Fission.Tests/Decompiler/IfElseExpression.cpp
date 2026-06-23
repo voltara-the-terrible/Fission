@@ -125,3 +125,27 @@ TEST_CASE("Lift: multi-statement if branches are not collapsed to an expression"
     CHECK_FALSE(std::regex_search(out, std::regex(R"(=\s*if\s+.+\s+then)")));
     CHECK(CountOccurrences(out, "print(") == 2);
 }
+
+// `local a = r and B or C` whose result is captured by a closure lowers (at O0) to a 2-instruction
+// arm (the `or`-recheck), so the lift-time detector bails and the recheck is then simplified away —
+// leaving a clean `local a; if not r then a=C else a=B end` that no other pass revisited. The
+// TwoWayValueDiamondFolder must fold it back into a single declaration.
+TEST_CASE("Lift: a recheck-simplified 2-way diamond is folded on the AST", "[Decompiler][IfElseExpr]") {
+    const auto out = DecompileOrFail(R"(
+        local Humanoid = game
+        local recoil = Vector3.new(0, 0, 0)
+        local a = recoil and Humanoid or ToolInfo
+        local function f()
+            return a, recoil, Humanoid
+        end
+        for i = 1, 3 do
+            warn(a, recoil, i)
+        end
+        return f
+    )", DecompilerFlags::UseIfElseExpressions, 0);
+    INFO("decompile:\n" << out);
+    // Folded to a single declaration with an if-else expression, not a statement `if` that assigns
+    // the same local in both arms.
+    CHECK(std::regex_search(out, std::regex(R"(=\s*if\s+\w+\s+then\s+\w+\s+else\s+\w+)")));
+    CHECK_FALSE(std::regex_search(out, std::regex(R"((?:^|\n)\s*if not \w+ then)")));
+}

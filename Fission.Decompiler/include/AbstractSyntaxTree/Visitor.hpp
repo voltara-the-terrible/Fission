@@ -18,7 +18,6 @@ class CommentNode;
 class BreakStatementNode;
 class ContinueStatementNode;
 class BlockStatementNode;
-class DoBlockNode;
 class WhileStatementNode;
 class IfStatementNode;
 class AssignmentStatementNode;
@@ -58,7 +57,6 @@ class Visitor {
     virtual void Visit(BreakStatementNode *lpNode) = 0;
     virtual void Visit(ContinueStatementNode *lpNode) = 0;
     virtual void Visit(BlockStatementNode *lpNode) = 0;
-    virtual void Visit(DoBlockNode *lpNode) = 0;
     virtual void Visit(WhileStatementNode *lpNode) = 0;
     virtual void Visit(IfStatementNode *lpNode) = 0;
     virtual void Visit(AssignmentStatementNode *lpNode) = 0;

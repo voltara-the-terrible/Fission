@@ -30,8 +30,6 @@ class ASTRewriter {
                     RewriteBlock(ifS->elseBranch->body);
             } else if (auto fn = std::dynamic_pointer_cast<FunctionDeclarationNode>(stmt); fn && fn->lpFunctionBody) {
                 RewriteBlock(fn->lpFunctionBody->body);
-            } else if (auto doB = std::dynamic_pointer_cast<DoBlockNode>(stmt); doB && doB->body) {
-                RewriteBlock(doB->body->body);
             } else if (auto w = std::dynamic_pointer_cast<WhileStatementNode>(stmt); w && w->body) {
                 RewriteBlock(w->body->body);
             } else if (auto r = std::dynamic_pointer_cast<RepeatStatementNode>(stmt); r && r->body) {

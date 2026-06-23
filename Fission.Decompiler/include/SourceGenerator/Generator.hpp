@@ -374,17 +374,6 @@ class SourceGenerator : public Visitor {
         }
     }
 
-    void Visit(DoBlockNode *lpNode) override {
-        buffer << this->GetIndentation() << "do";
-        this->NextLine();
-        this->IncreaseIndentation();
-        if (lpNode->body)
-            lpNode->body->Accept(this);
-        this->DecreaseIndentation();
-        buffer << this->GetIndentation() << "end";
-        this->NextLine();
-    }
-
     void Visit(WhileStatementNode *lpNode) override {
         (void)lpNode;
         buffer << this->GetIndentation() << "while ";

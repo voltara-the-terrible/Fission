@@ -109,16 +109,6 @@ class BlockStatementNode : public Statement {
     void Accept(Visitor *visitor) override { visitor->Visit(this); }
 };
 
-// an explicit lexical `do ... end` scope. Detected from register-stack resets in
-// straight-line code (locals declared inside are freed at `end`, the registers reused after).
-class DoBlockNode : public Statement {
-  public:
-    std::shared_ptr<BlockStatementNode> body;
-    DoBlockNode() : body(std::make_shared<BlockStatementNode>()) {}
-    explicit DoBlockNode(std::shared_ptr<BlockStatementNode> b) : body(std::move(b)) {}
-    void Accept(Visitor *visitor) override { visitor->Visit(this); }
-};
-
 class AssignmentStatementNode : public Statement {
   public:
     std::shared_ptr<Expression> left;

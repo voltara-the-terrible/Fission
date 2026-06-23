@@ -5,10 +5,11 @@
 
 #include "AbstractSyntaxTree/Nodes/CommentNode.hpp"
 #include "Analysis/RobloxTypeInferer.hpp"
+#include "Rewriters/BranchTailHoister.hpp"
 #include "Rewriters/DeadLocalEliminator.hpp"
-#include "Rewriters/DoBlockLocalRenamer.hpp"
 #include "Rewriters/IfChainSimplifier.hpp"
 #include "Rewriters/ShortCircuitFolder.hpp"
+#include "Rewriters/TwoWayValueDiamondFolder.hpp"
 #include "SafetyGuard.hpp"
 
 #include <libassert/assert.hpp>
@@ -186,8 +187,6 @@ static std::string FormatDecompilerOptions(DecompilerFlags flags) {
         enabled.emplace_back("UseIfElseExpressions");
     if ((flags & DecompilerFlags::DebugInfo) == DecompilerFlags::DebugInfo)
         enabled.emplace_back("DebugInfo");
-    if ((flags & DecompilerFlags::RecoverDoEndFromLineInfo) == DecompilerFlags::RecoverDoEndFromLineInfo)
-        enabled.emplace_back("RecoverDoEndFromLineInfo");
 
     if (enabled.empty())
         return "None";
@@ -719,7 +718,6 @@ DecompilationResult Decompiler::CommonDecompilerEntryImpl(const std::string &byt
     const auto astStart = std::chrono::steady_clock::now();
     ASTLifter.m_useIfElseExpressions = (flags & DecompilerFlags::UseIfElseExpressions) == DecompilerFlags::UseIfElseExpressions;
     ASTLifter.m_emitDebugInfo = (flags & DecompilerFlags::DebugInfo) == DecompilerFlags::DebugInfo;
-    ASTLifter.m_recoverDoEndFromLines = (flags & DecompilerFlags::RecoverDoEndFromLineInfo) == DecompilerFlags::RecoverDoEndFromLineInfo;
     auto liftedAST = ASTLifter.Lift(controlFlowAnalyzedFunction);
     AddDecompilerOptionsToHeader(liftedAST, flags);
 
@@ -731,6 +729,9 @@ DecompilationResult Decompiler::CommonDecompilerEntryImpl(const std::string &byt
     const auto ifChainStart = std::chrono::steady_clock::now();
     IfChainSimplifier{}.Run(liftedAST.statements);
     const auto ifChainEnd = std::chrono::steady_clock::now();
+    const bool useIfElseExpressions = (flags & DecompilerFlags::UseIfElseExpressions) == DecompilerFlags::UseIfElseExpressions;
+    TwoWayValueDiamondFolder{useIfElseExpressions}.Run(liftedAST.statements);
+    BranchTailHoister{}.Run(liftedAST.statements);
     DeadLocalEliminator{}.Run(liftedAST.statements);
     const auto astRewriteEnd = std::chrono::steady_clock::now();
 
@@ -751,9 +752,6 @@ DecompilationResult Decompiler::CommonDecompilerEntryImpl(const std::string &byt
         RobloxTypeInferer{}.Infer(liftedAST, inferRobloxTypes, autoNameVariables);
     const auto robloxPropagationEnd = std::chrono::steady_clock::now();
 
-    // Give do-block locals distinct, non-shadowing names (the register-based naming reuses `vN`
-    // across sibling do-blocks and shadows outer locals).
-    DoBlockLocalRenamer{}.Run(liftedAST.statements);
     const auto astEnd = std::chrono::steady_clock::now();
 
     RootNode root{liftedAST.statements};

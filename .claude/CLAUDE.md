@@ -58,7 +58,7 @@ Behavior is driven by `DecompilerFlags` (bitflag enum in `DecompilerFlags.hpp`, 
 
 ### AST rewriters
 
-Structural post-passes subclass `ASTRewriter` (`Rewriters/ASTRewriter.hpp`) and implement `RewriteStatements`. The base walks every block (including closures, loop/if bodies, reconstructed `do…end` scopes) **post-order** and hands each owning `std::vector<std::shared_ptr<Statement>>&` to the subclass — the Visitor pattern can't restructure a parent's statement list, which is why rewriters take the vector directly. Add new structural passes the same way and slot them into the ordered run in `Decompiler.cpp`.
+Structural post-passes subclass `ASTRewriter` (`Rewriters/ASTRewriter.hpp`) and implement `RewriteStatements`. The base walks every block (including closures, loop/if bodies) **post-order** and hands each owning `std::vector<std::shared_ptr<Statement>>&` to the subclass — the Visitor pattern can't restructure a parent's statement list, which is why rewriters take the vector directly. Add new structural passes the same way and slot them into the ordered run in `Decompiler.cpp`.
 
 ## Conventions
 

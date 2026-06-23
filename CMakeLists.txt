@@ -261,7 +261,6 @@ if (BUILD_TESTING)
             Fission.Tests/Decompiler/ControlFlowRegressions.cpp
             Fission.Tests/Decompiler/ComplexControlFlow.cpp
             Fission.Tests/Decompiler/TypeInference.cpp
-            Fission.Tests/Decompiler/DoEndBlocks.cpp
             Fission.Tests/Decompiler/IfElseExpression.cpp
     )
 

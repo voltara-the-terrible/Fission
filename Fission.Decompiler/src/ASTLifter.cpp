@@ -845,7 +845,6 @@ ASTFunction ASTLifter::Lift(AnalyzedFunction &analyzedFunction) {
         ASTLifter subLifter;
         subLifter.m_useIfElseExpressions = m_useIfElseExpressions;
         subLifter.m_emitDebugInfo = m_emitDebugInfo;
-        subLifter.m_recoverDoEndFromLines = m_recoverDoEndFromLines;
         ast.subFunctions.push_back(subLifter.Lift(subFunc));
     }
 
@@ -1629,7 +1628,7 @@ std::vector<std::shared_ptr<Statement>> ASTLifter::LiftBlockInstructions(const B
     std::vector<std::shared_ptr<Statement>> statements;
     // {source instruction, statements.size() before that instruction was lifted}. Recorded at the top of
     // each processed instruction so each produced statement can be mapped back to its instruction for
-    // do...end scope grouping. Robust to inner break/continue since it is recorded before the switch.
+    // DebugInfo annotation. Robust to inner break/continue since it is recorded before the switch.
     std::vector<std::pair<int, size_t>> stmtMarks;
     if (!block.lpHead)
         return statements;
@@ -1886,7 +1885,6 @@ std::vector<std::shared_ptr<Statement>> ASTLifter::LiftBlockInstructions(const B
             ASTLifter subLifter;
             subLifter.m_useIfElseExpressions = m_useIfElseExpressions;
             subLifter.m_emitDebugInfo = m_emitDebugInfo;
-            subLifter.m_recoverDoEndFromLines = m_recoverDoEndFromLines;
             ASTFunction subAst = subLifter.Lift(*targetFunc);
 
             std::string funcName = this->GetFunctionName(duplicatedFunction);
@@ -2072,7 +2070,6 @@ std::vector<std::shared_ptr<Statement>> ASTLifter::LiftBlockInstructions(const B
             ASTLifter subLifter;
             subLifter.m_useIfElseExpressions = m_useIfElseExpressions;
             subLifter.m_emitDebugInfo = m_emitDebugInfo;
-            subLifter.m_recoverDoEndFromLines = m_recoverDoEndFromLines;
             ASTFunction subAst = subLifter.Lift(*targetFunc);
 
             std::string funcName = this->GetFunctionName(proto);
@@ -2272,10 +2269,10 @@ std::vector<std::shared_ptr<Statement>> ASTLifter::LiftBlockInstructions(const B
         }
     }
 
-    auto grouped = GroupDoScopes(block, std::move(statements), stmtMarks);
+    auto grouped = std::move(statements);
 
     // DebugInfo: bracket the block's lifted statements with its basic-block id so the decompiled
-    // output maps back to the IR. Placed outside the do-block grouping (marks the BB boundary).
+    // output maps back to the IR. Marks the BB boundary.
     if (m_emitDebugInfo && !grouped.empty()) {
         std::vector<std::shared_ptr<Statement>> wrapped;
         wrapped.reserve(grouped.size() + 2);
@@ -2325,407 +2322,6 @@ void ASTLifter::TagDebugAnnotation(const std::shared_ptr<Statement> &stmt, int l
         return;
     const std::string regStr = (maxReg < 0) ? "-" : std::format("R{}-R{}", minReg, maxReg);
     stmt->debugAnnotation = std::format("Line: {}, Register: {}, OpCode: {}", LineForPc(lineInstr), regStr, op);
-}
-
-std::vector<ASTLifter::DoScopeInterval> ASTLifter::ComputeDoScopes(
-    const BasicBlock &block, const std::vector<std::pair<int, size_t>> &stmtMarks, const std::vector<std::shared_ptr<Statement>> &statements
-) {
-    std::vector<DoScopeInterval> scopes;
-    if (!block.lpHead || !block.lpTail)
-        return scopes;
-    const int lo = block.lpHead->instructionIndex;
-    const int hi = block.lpTail->instructionIndex;
-    if (hi <= lo)
-        return scopes;
-
-    // When the bytecode carries local-variable debug info (debugLevel >= 2), it gives exact lexical
-    // scopes — use it instead of the register-reuse heuristic. (Lifted instructionIndex == bytecode
-    // PC, the space locvars use, because the lifter emits one entry per bytecode word.)
-    if (!m_currentFunction->lpLiftedFunction->lpDeserialized->locvars.empty())
-        return ComputeDoScopesFromLocvars(lo, hi);
-
-    auto &instrs = m_currentFunction->lpLiftedFunction->instructions;
-    const int numParams = m_currentFunction->lpLiftedFunction->lpDeserialized->numparams;
-
-    auto instrForStmt = [&](size_t k) -> int {
-        int instr = -1;
-        for (const auto &m : stmtMarks) {
-            if (m.second <= k)
-                instr = m.first;
-            else
-                break;
-        }
-        return instr;
-    };
-
-    // The register an instruction defines, but only if it materialised a statement that writes a
-    // register (a `local`/reassignment, not an inlined temp and not a global/table/upvalue store).
-    auto materializedDefReg = [&](int instr) -> int {
-        if (instr < lo || instr > hi)
-            return -1;
-        const auto &di = instrs[instr];
-        if (di.operands.empty() || di.operands[0].type != LiftedOperandType::Register)
-            return -1;
-        if (m_currentFunction->GetDefinition(di.operands[0]) != &di)
-            return -1; // operand[0] is a read (e.g. SETGLOBAL value), not this instruction's def.
-        return di.operands[0].value.reg;
-    };
-    std::unordered_map<int, int> stmtDefReg; // source instruction -> register it materialises
-    for (size_t k = 0; k < statements.size(); ++k) {
-        const auto &s = statements[k];
-        const bool isDef = std::dynamic_pointer_cast<VariableDeclarationNode>(s) || std::dynamic_pointer_cast<AssignmentStatementNode>(s) ||
-                           std::dynamic_pointer_cast<CompoundBinaryExpressionNode>(s);
-        if (!isDef)
-            continue;
-        const int instr = instrForStmt(k);
-        const int r = materializedDefReg(instr);
-        if (r >= 0)
-            stmtDefReg[instr] = r;
-    }
-    if (stmtDefReg.empty())
-        return scopes; // no register-defining statements → nothing to scope.
-
-    // Per-register live ranges in the block + register-stack top at every boundary. boundary b sits
-    // before instruction (lo + b); the last boundary (b = nB-1) is after instruction hi.
-    const int nB = hi - lo + 2;
-    std::vector<std::vector<int>> addAt(nB), remAt(nB);
-    std::unordered_map<int, std::vector<int>> writeInstrs;        // physical register -> instructions defining it (in block)
-    std::vector<std::tuple<int, int, int>> blockLocalDefs;        // (defInstr, reg, lastUse) for non-escaping defs
-
-    for (const auto &[ref, defInst] : m_currentFunction->definitionMap) {
-        if (!defInst)
-            continue;
-        const int d = defInst->instructionIndex;
-        const int r = ref.regIndex;
-
-        int lastInBlock = -1; // last use within [lo, hi]
-        bool liveOut = false; // used after the block (stays reserved through the block's end)
-        if (auto it = m_currentFunction->users.find(ref); it != m_currentFunction->users.end())
-            for (auto *u : it->second) {
-                const int ui = u->instructionIndex;
-                if (ui >= lo && ui <= hi)
-                    lastInBlock = std::max(lastInBlock, ui);
-                else if (ui > hi)
-                    liveOut = true;
-            }
-
-        // Occupancy: the value sits on the register stack across boundaries (d, end], clamped to the
-        // block. Values defined before the block but still live inside it (live-ins) are included, so
-        // the baseline is right in merge blocks reached through control flow.
-        const int occEndAbs = liveOut ? (hi + 1) : lastInBlock;
-        if (occEndAbs >= 0) {
-            const int occStartAbs = std::max(d + 1, lo);
-            if (occEndAbs >= occStartAbs) {
-                const int bs = occStartAbs - lo;
-                const int be = occEndAbs - lo;
-                if (bs < nB) {
-                    addAt[std::max(bs, 0)].push_back(r);
-                    if (be + 1 < nB)
-                        remAt[be + 1].push_back(r);
-                }
-            }
-        }
-
-        // Block-local bookkeeping only for defs inside this block.
-        if (d >= lo && d <= hi) {
-            writeInstrs[r].push_back(d);
-            if (!liveOut)
-                blockLocalDefs.emplace_back(d, r, lastInBlock >= 0 ? lastInBlock : d);
-        }
-    }
-
-    std::vector<int> top(nB, 0);
-    std::multiset<int> occ;
-    for (int b = 0; b < nB; ++b) {
-        for (int r : addAt[b])
-            occ.insert(r);
-        for (int r : remAt[b])
-            if (auto it = occ.find(r); it != occ.end())
-                occ.erase(it);
-        const int occTop = occ.empty() ? 0 : (*occ.rbegin() + 1);
-        top[b] = std::max(occTop, numParams); // params are persistent; floor the baseline at them.
-    }
-    for (auto &[r, v] : writeInstrs)
-        std::sort(v.begin(), v.end());
-
-    auto reusedAfter = [&](int reg, int e) -> bool {
-        auto it = writeInstrs.find(reg);
-        if (it == writeInstrs.end())
-            return false;
-        for (int w : it->second)
-            if (w > e)
-                return true; // register written again after the excursion → the "jump back".
-        return false;
-    };
-
-    // Walk boundaries: a rise records where each register level was opened; a fall closes the
-    // excursion that returned to that level. Keep it only when its base register materialised a
-    // local-like statement and is reused afterwards.
-    std::vector<std::pair<int, int>> rawScopes;
-    std::unordered_map<int, int> openInstrAtLevel;
-    int prev = top[0];
-    for (int b = 1; b < nB; ++b) {
-        const int cur = top[b];
-        const int producedBy = lo + b - 1; // instruction whose execution created boundary b
-        if (cur > prev) {
-            for (int L = prev; L < cur; ++L)
-                openInstrAtLevel[L] = producedBy;
-        } else if (cur < prev) {
-            const int e = producedBy;
-            // The drop freed levels [cur, prev-1]. A dead-but-reserved register below leaves a gap, so
-            // the level the top returns to is not necessarily the do-block's base — scan upward for the
-            // lowest level whose opener actually materialised a local at that register and is reused.
-            for (int base = cur; base < prev; ++base) {
-                auto oit = openInstrAtLevel.find(base);
-                if (oit == openInstrAtLevel.end())
-                    continue;
-                const int s = oit->second;
-                if (e > s && stmtDefReg.count(s) && stmtDefReg[s] == base && reusedAfter(base, e)) {
-                    rawScopes.push_back({s, e});
-                    break; // lowest valid base owns the whole freed frame
-                }
-            }
-        }
-        prev = cur;
-    }
-
-    // Keep outermost, non-overlapping intervals (v1 does not nest), then attach each scope's
-    // block-local registers (defined and dead entirely within it).
-    std::sort(rawScopes.begin(), rawScopes.end());
-    int lastEnd = -1;
-    for (const auto &sc : rawScopes) {
-        if (sc.first <= lastEnd)
-            continue;
-        lastEnd = sc.second;
-        DoScopeInterval interval{sc.first, sc.second, {}};
-        for (const auto &[d, r, lastUse] : blockLocalDefs)
-            if (d >= sc.first && d <= sc.second && lastUse <= sc.second)
-                interval.localRegs.insert(r);
-        scopes.push_back(std::move(interval));
-    }
-    return scopes;
-}
-
-std::vector<ASTLifter::DoScopeInterval> ASTLifter::ComputeDoScopesFromLocvars(int lo, int hi) {
-    std::vector<DoScopeInterval> scopes;
-    const auto &locvars = m_currentFunction->lpLiftedFunction->lpDeserialized->locvars;
-
-    // Group block-scoped locals by the PC where they go out of scope. Locals sharing an end PC leave
-    // the same `do ... end`; a local whose scope reaches the block's end is function-/outer-scoped.
-    std::unordered_map<int, std::pair<int, std::unordered_set<int>>> groups; // endpc -> {min def instr, regs}
-    for (const auto &lv : locvars) {
-        const int defInstr = lv.startpc - 1; // the instruction that defines the local
-        const int endInstr = lv.endpc - 1;   // last instruction the local is live at
-        if (lv.endpc > hi)                   // scope reaches the block end → not a nested do-block
-            continue;
-        if (defInstr < lo || endInstr > hi || endInstr <= defInstr)
-            continue;
-        auto &g = groups[lv.endpc];
-        if (g.second.empty() || defInstr < g.first)
-            g.first = defInstr;
-        g.second.insert(lv.reg);
-    }
-    for (const auto &[endpc, g] : groups)
-        scopes.push_back(DoScopeInterval{g.first, endpc - 1, g.second});
-
-    // Keep outermost, non-overlapping intervals (v1 does not nest).
-    std::sort(scopes.begin(), scopes.end(), [](const DoScopeInterval &a, const DoScopeInterval &b) { return a.start < b.start; });
-    std::vector<DoScopeInterval> filtered;
-    int lastEnd = -1;
-    for (auto &sc : scopes)
-        if (sc.start > lastEnd) {
-            lastEnd = sc.end;
-            filtered.push_back(std::move(sc));
-        }
-    return filtered;
-}
-
-std::vector<ASTLifter::DoScopeInterval> ASTLifter::ComputeDoScopesFromLineGaps(
-    const BasicBlock &block, const std::vector<std::pair<int, size_t>> &stmtMarks, const std::vector<std::shared_ptr<Statement>> &statements
-) {
-    std::vector<DoScopeInterval> scopes;
-    auto *des = m_currentFunction->lpLiftedFunction->lpDeserialized;
-    if (des->lineinfo.empty() || statements.empty() || stmtMarks.empty() || !block.lpHead || !block.lpTail)
-        return scopes;
-    const int lo = block.lpHead->instructionIndex;
-    const int hi = block.lpTail->instructionIndex;
-
-    auto instrForStmt = [&](size_t k) -> int {
-        int instr = -1;
-        for (const auto &m : stmtMarks) {
-            if (m.second <= k)
-                instr = m.first;
-            else
-                break;
-        }
-        return instr;
-    };
-
-    // statement -> (instruction, source line) for statements in this block
-    struct SInfo {
-        size_t k;
-        int instr;
-        int line;
-    };
-    std::vector<SInfo> info;
-    for (size_t k = 0; k < statements.size(); ++k) {
-        const int in = instrForStmt(k);
-        if (in < lo || in > hi)
-            continue;
-        info.push_back({k, in, LineForPc(in)});
-    }
-    if (info.size() < 2)
-        return scopes;
-
-    // A do...end block is a maximal run of statements with no internal line gap that is bracketed by
-    // a line gap on both sides (the `do` line before, the `end` line after) — the do/end keywords emit
-    // no instructions. These blocks reassign outer vars (no own local), so their locals are hoisted by
-    // GroupDoScopes rather than re-localised; the run only needs to actually declare/assign a variable.
-    const size_t n = info.size();
-    for (size_t i = 0; i < n;) {
-        size_t j = i;
-        while (j + 1 < n && info[j + 1].line <= info[j].line + 1)
-            ++j;
-        const bool gapBefore = (i > 0) && (info[i].line > info[i - 1].line + 1);
-        const bool gapAfter = (j + 1 < n) && (info[j + 1].line > info[j].line + 1);
-        if (gapBefore && gapAfter) {
-            bool hasVar = false;
-            for (size_t t = i; t <= j; ++t)
-                if (std::dynamic_pointer_cast<VariableDeclarationNode>(statements[info[t].k]) ||
-                    std::dynamic_pointer_cast<AssignmentStatementNode>(statements[info[t].k])) {
-                    hasVar = true;
-                    break;
-                }
-            if (hasVar) {
-                DoScopeInterval iv{info[i].instr, info[j].instr, {}};
-                iv.fromLineGap = true;
-                scopes.push_back(iv);
-            }
-        }
-        i = j + 1;
-    }
-    return scopes;
-}
-
-std::vector<std::shared_ptr<Statement>> ASTLifter::GroupDoScopes(
-    const BasicBlock &block, std::vector<std::shared_ptr<Statement>> statements, const std::vector<std::pair<int, size_t>> &stmtMarks
-) {
-    if (statements.empty())
-        return statements;
-    auto scopes = ComputeDoScopes(block, stmtMarks, statements);
-
-    // Opt-in: also recover do...end blocks that leave no register signal, from source line gaps.
-    if (m_recoverDoEndFromLines) {
-        for (const auto &g : ComputeDoScopesFromLineGaps(block, stmtMarks, statements)) {
-            bool overlaps = false;
-            for (const auto &es : scopes)
-                if (!(g.end < es.start || g.start > es.end)) {
-                    overlaps = true;
-                    break;
-                }
-            if (!overlaps)
-                scopes.push_back(g);
-        }
-        std::sort(scopes.begin(), scopes.end(), [](const DoScopeInterval &a, const DoScopeInterval &b) { return a.start < b.start; });
-    }
-
-    if (scopes.empty())
-        return statements;
-
-    auto &instrs = m_currentFunction->lpLiftedFunction->instructions;
-    auto instrForStmt = [&](size_t k) -> int {
-        int instr = -1;
-        for (const auto &m : stmtMarks) {
-            if (m.second <= k)
-                instr = m.first;
-            else
-                break;
-        }
-        return instr;
-    };
-    // The register an instruction writes (its own SSA def), or -1.
-    auto defRegOf = [&](int instr) -> int {
-        if (instr < 0 || instr >= static_cast<int>(instrs.size()))
-            return -1;
-        const auto &di = instrs[instr];
-        if (di.operands.empty() || di.operands[0].type != LiftedOperandType::Register)
-            return -1;
-        if (m_currentFunction->GetDefinition(di.operands[0]) != &di)
-            return -1;
-        return di.operands[0].value.reg;
-    };
-
-    // Line-gap do-blocks only reassign outer vars, so their locals must be declared *before* the block
-    // (hoisted), not re-localised inside it — otherwise an outer var used after the block would be
-    // scoped away. De-localise such declarations and collect their names to hoist.
-    std::vector<std::string> hoistNames;
-    {
-        std::unordered_set<std::string> seen;
-        auto inLineGap = [&](int instr) -> bool {
-            for (const auto &sc : scopes)
-                if (sc.fromLineGap && instr >= sc.start && instr <= sc.end)
-                    return true;
-            return false;
-        };
-        for (size_t k = 0; k < statements.size(); ++k) {
-            if (!inLineGap(instrForStmt(k)))
-                continue;
-            auto decl = std::dynamic_pointer_cast<VariableDeclarationNode>(statements[k]);
-            if (!decl || !decl->value)
-                continue;
-            auto id = std::dynamic_pointer_cast<IdentifierExpressionNode>(decl->identifier);
-            if (!id || !id->identifier)
-                continue;
-            statements[k] = std::make_shared<AssignmentStatementNode>(decl->identifier, decl->value);
-            if (seen.insert(id->identifier->name).second)
-                hoistNames.push_back(id->identifier->name);
-        }
-    }
-
-    // Statements are produced in instruction order, so their source instructions are monotonic and
-    // align with the sorted, non-overlapping scope intervals.
-    std::vector<std::shared_ptr<Statement>> result;
-    size_t si = 0;
-    bool hoistsEmitted = false;
-    for (size_t k = 0; k < statements.size();) {
-        const int instr = instrForStmt(k);
-        if (si < scopes.size() && instr >= scopes[si].start && instr <= scopes[si].end) {
-            const auto &scope = scopes[si];
-            if (scope.fromLineGap && !hoistsEmitted) {
-                for (const auto &name : hoistNames)
-                    result.push_back(std::make_shared<VariableDeclarationNode>(std::make_shared<Identifier>(name)));
-                hoistsEmitted = true;
-            }
-            auto doBlock = std::make_shared<DoBlockNode>();
-            std::unordered_set<int> declared; // block-local regs already re-`local`ed in this scope
-            while (k < statements.size()) {
-                const int ins = instrForStmt(k);
-                if (ins < scope.start || ins > scope.end)
-                    break;
-                auto stmt = statements[k];
-                // The first write to a block-local register inside the scope must read as `local`.
-                // It may have lifted to a bare reassignment because the register was defined in an
-                // earlier sibling scope (m_definedRegisters is function-wide); restore the `local`.
-                const int r = defRegOf(ins);
-                if (r >= 0 && scope.localRegs.count(r) && !declared.count(r)) {
-                    declared.insert(r);
-                    if (auto asn = std::dynamic_pointer_cast<AssignmentStatementNode>(stmt);
-                        asn && std::dynamic_pointer_cast<IdentifierExpressionNode>(asn->left))
-                        stmt = std::make_shared<VariableDeclarationNode>(asn->left, asn->right);
-                }
-                doBlock->body->body.push_back(stmt);
-                ++k;
-            }
-            result.push_back(doBlock);
-            ++si;
-        } else {
-            if (si < scopes.size() && instr > scopes[si].end)
-                ++si;
-            result.push_back(statements[k]);
-            ++k;
-        }
-    }
-    return result;
 }
 
 bool ASTLifter::CanReach(uint32_t start, uint32_t target, uint32_t stopBlock, const std::set<uint32_t> &visitedScopes) {

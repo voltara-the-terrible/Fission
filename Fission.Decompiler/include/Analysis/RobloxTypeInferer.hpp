@@ -26,7 +26,6 @@ class RobloxTypeInferer : public Visitor {
     void Visit(BreakStatementNode *lpNode) override;
     void Visit(ContinueStatementNode *lpNode) override;
     void Visit(BlockStatementNode *lpNode) override;
-    void Visit(DoBlockNode *lpNode) override;
     void Visit(WhileStatementNode *lpNode) override;
     void Visit(IfStatementNode *lpNode) override;
     void Visit(AssignmentStatementNode *lpNode) override;
@@ -68,6 +67,7 @@ class RobloxTypeInferer : public Visitor {
     static std::optional<std::string> ClassArgument(const std::vector<std::shared_ptr<Expression>> &args, size_t index);
     static std::optional<std::string> CallReturnType(const std::string &methodName, const std::vector<std::shared_ptr<Expression>> &args, size_t classArgIndex);
     static std::optional<std::string> CallAutoName(const std::string &methodName, const std::vector<std::shared_ptr<Expression>> &args, size_t classArgIndex);
+    static std::optional<std::string> ConventionalFieldName(const std::string &field);
     static std::string SanitizeIdentifier(std::string name);
     static void AnnotateCallReturn(CallExpressionNode *call, const std::optional<std::string> &type, TypeEnv &env);
     static void AnnotateCallReturn(NameCallExpressionNode *call, const std::optional<std::string> &type, TypeEnv &env);
