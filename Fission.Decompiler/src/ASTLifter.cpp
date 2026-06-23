@@ -1732,6 +1732,14 @@ std::vector<std::shared_ptr<Statement>> ASTLifter::LiftControlFlow(uint32_t curr
                     LiftedOperand op;
                     op.type = LiftedOperandType::Register;
 
+                    // Pin the loop-variable registers (R(base+3 .. base+3+numVars-1)) so the body and the
+                    // variable list resolve them to their own register name. FORGPREP reuses these registers,
+                    // so without pinning LiftExpression inlines a stale pre-loop definition that happened to
+                    // occupy the same register — emitting an expression in the binding position
+                    // (`for k, v62 .. "x" in ...`, illegal Lua) and mis-resolving body uses of the loop var.
+                    for (int i = 0; i < numVars; ++i)
+                        m_pinnedRegisters.insert(baseReg + 3 + i);
+
                     int32_t genVer = -1, stateVer = -1, indexVer = -1;
                     if (m_currentFunction->implicitUses.contains(block.lpTail)) {
                         const auto &impl = m_currentFunction->implicitUses.at(block.lpTail);
@@ -1754,8 +1762,13 @@ std::vector<std::shared_ptr<Statement>> ASTLifter::LiftControlFlow(uint32_t curr
                         LiftedOperand varOp;
                         varOp.type = LiftedOperandType::Register;
                         varOp.value.reg = baseReg + 3 + i;
+                        varOp.ssaVersion = 0;
                         forNode->loopVariables.push_back(LiftExpression(varOp));
                     }
+
+                    // loop-variable registers are no longer the pinned induction vars past this point.
+                    for (int i = 0; i < numVars; ++i)
+                        m_pinnedRegisters.erase(baseReg + 3 + i);
 
                     // Check if all 3 implicit uses come from the same CALL (e.g. pairs(t))
                     LiftedOperand genCheck{op};
@@ -3187,8 +3200,9 @@ std::shared_ptr<Expression> ASTLifter::LiftExpression(const LiftedOperand &__ope
         return curr;
     }
     case LiftedOperation::GETTABLE:
+    case LiftedOperation::GETTABLEN:
     case LiftedOperation::GETTABLEKS: {
-        // Walk member chains `a.b.c.d.e.f` iteratively. Each GETTABLE(KS) takes operands[1]
+        // Walk member chains `a.b.c.d.e.f` iteratively. Each GETTABLE(KS/N) takes operands[1]
         // as the base; recursing left stacks one frame per dotted hop.
         struct Hop {
             bool isKeyed;
@@ -3205,6 +3219,12 @@ std::shared_ptr<Expression> ASTLifter::LiftExpression(const LiftedOperand &__ope
                 hop.isKeyed = false;
                 const auto &k = m_currentFunction->lpLiftedFunction->lpDeserialized->constants[curDef->operands[2].value.imm.k];
                 hop.memberName = std::get<std::string>(k.constantData);
+            } else if (curDef->operation == LiftedOperation::GETTABLEN) {
+                // GETTABLEN R(A) = R(B)[C+1]: the immediate is the 0-based slot, the Lua index is C+1.
+                // Emit a plain number (matching the GETTABLE integer-key path) rather than the `Ni`
+                // native-integer literal, which would not parse as a table index in standard Luau.
+                hop.isKeyed = true;
+                hop.indexExpr = std::make_shared<NumberLiteralNode>(static_cast<double>(curDef->operands[2].value.imm.n + 1));
             } else {
                 hop.isKeyed = true;
                 hop.indexExpr = LiftExpression(curDef->operands[2]);
@@ -3230,7 +3250,8 @@ std::shared_ptr<Expression> ASTLifter::LiftExpression(const LiftedOperand &__ope
             }
             const auto *leftDef = m_currentFunction->GetDefinition(leftOp);
             if (!leftDef || m_processedInstructions.contains(leftDef->instructionIndex) || !ShouldInline(leftDef) ||
-                (leftDef->operation != LiftedOperation::GETTABLE && leftDef->operation != LiftedOperation::GETTABLEKS)) {
+                (leftDef->operation != LiftedOperation::GETTABLE && leftDef->operation != LiftedOperation::GETTABLEKS &&
+                 leftDef->operation != LiftedOperation::GETTABLEN)) {
                 leftLeafOp = leftOp;
                 leftLeafSet = true;
                 break;
@@ -3559,6 +3580,30 @@ std::shared_ptr<TableLiteralNode> ASTLifter::LiftTableLiteral(const LiftedInstru
                                                      // reject inlining.
 }
 
+// Would inlining a value defined in block `defBlk` into its use in block `useBlk` pull the
+// definition across a loop boundary — i.e. is the use inside a loop the def does not belong to?
+// Bytecode is linearised in PC order, so a natural loop's body is the contiguous block-id range
+// [header, latch]. Inlining a side-effecting/non-idempotent def (a CALL) into such a use would
+// re-evaluate it every iteration (the `local v = math.random(...)` hoist the source intends).
+// A false positive only keeps a correct `local`, so this is sound to apply to value-producing calls.
+static bool InliningCrossesLoopBoundary(AnalyzedFunction *fn, int32_t defBlk, int32_t useBlk) {
+    if (!fn || defBlk < 0 || useBlk < 0 || defBlk == useBlk)
+        return false;
+    for (const auto &b : fn->basicBlocks) {
+        if (!b.loopLatch.has_value())
+            continue; // b is a loop header; its body spans [b.dwBlockId, latch].
+        uint32_t lo = b.dwBlockId;
+        uint32_t hi = b.loopLatch.value();
+        if (hi < lo)
+            std::swap(lo, hi);
+        const bool useIn = static_cast<uint32_t>(useBlk) >= lo && static_cast<uint32_t>(useBlk) <= hi;
+        const bool defIn = static_cast<uint32_t>(defBlk) >= lo && static_cast<uint32_t>(defBlk) <= hi;
+        if (useIn && !defIn)
+            return true;
+    }
+    return false;
+}
+
 bool ASTLifter::ShouldInline(const LiftedInstruction *inst) {
     if (!inst || inst->operands.size() < 1)
         return false;
@@ -3637,6 +3682,10 @@ bool ASTLifter::ShouldInline(const LiftedInstruction *inst) {
                     auto users = m_currentFunction->users[{static_cast<uint8_t>(regA), ref.version}];
                     if (users.size() == 1) {
                         auto op = users[0]->operation;
+                        // a method call is non-idempotent; never inline it into a use inside a loop it
+                        // does not live in (would re-invoke it each iteration).
+                        if (InliningCrossesLoopBoundary(m_currentFunction, m_currentFunction->GetBlockId(inst), m_currentFunction->GetBlockId(users[0])))
+                            return false;
                         // allow inlining returns, other Calls, arith ops, and store sinks
                         // (`t.f = obj:m()`, `upval = obj:m()`, `glob = obj:m()`).
                         if (op == LiftedOperation::RETURN || op == LiftedOperation::CALL || op == LiftedOperation::NAMECALL || op == LiftedOperation::ADD ||
@@ -3675,6 +3724,10 @@ bool ASTLifter::ShouldInline(const LiftedInstruction *inst) {
         auto users = m_currentFunction->users[usedRef];
         if (users.size() == 1) {
             auto op = users[0]->operation;
+            // a plain call is non-idempotent; never inline it into a use inside a loop it does not
+            // live in (would re-invoke it each iteration — e.g. a hoisted `local v = math.random(...)`).
+            if (InliningCrossesLoopBoundary(m_currentFunction, m_currentFunction->GetBlockId(inst), m_currentFunction->GetBlockId(users[0])))
+                return false;
             if (op == LiftedOperation::RETURN || op == LiftedOperation::CALL || op == LiftedOperation::NAMECALL || op == LiftedOperation::ADD ||
                 op == LiftedOperation::SUB || op == LiftedOperation::MUL || op == LiftedOperation::DIV || op == LiftedOperation::MOD ||
                 op == LiftedOperation::POW || op == LiftedOperation::CONCAT || op == LiftedOperation::MINUS || op == LiftedOperation::NOT ||
@@ -4060,13 +4113,26 @@ std::optional<ASTLifter::OrChainInfo> ASTLifter::DetectOrChain(uint32_t headerId
     uint32_t cur = headerId;
     uint32_t elseIdx = static_cast<uint32_t>(-1);
     bool invertedFinal = false;
+    bool hasComparison = false; // at least one link is a comparison → not an all-truthiness value short-circuit.
 
     while (cur < blocks.size() && !guard.contains(cur)) {
         const auto &b = blocks[cur];
         if (b.bType != BlockType::IfHeader || !b.ifStatementTrue.has_value() || !b.ifStatementFalse.has_value())
             break;
-        if (!b.lpTail || !IsComparisonConditional(b.lpTail->operation))
-            break; // truthiness link → leave to the short-circuit expression folders
+        if (!b.lpTail)
+            break;
+        const auto linkOp = b.lpTail->operation;
+        const bool isComparison = IsComparisonConditional(linkOp);
+        const bool isTruthiness = (linkOp == LiftedOperation::JUMPIF || linkOp == LiftedOperation::JUMPIFNOT);
+        // Comparison links always anchor a guard OR-chain. A bare truthiness link can be part of a
+        // mixed guard (`not foo or x <= 0`), but it is also how Luau lowers a *value* short-circuit
+        // (`x = a and b or c`); the structural `invertedFinal` requirement below already excludes those
+        // (they terminate in a value-assign fall-through, not an inverted IfHeader), and a link that
+        // materialises a boolean (LOADB diamond) is vetoed here so it is left to the value folders.
+        if (!isComparison && !isTruthiness)
+            break;
+        if (isTruthiness && DetectBooleanMaterialization(cur).has_value())
+            break;
 
         const uint32_t bt = b.ifStatementTrue.value();
         const uint32_t bf = b.ifStatementFalse.value();
@@ -4074,6 +4140,7 @@ std::optional<ASTLifter::OrChainInfo> ASTLifter::DetectOrChain(uint32_t headerId
         if (bt == body) {
             links.push_back({cur, false});
             guard.insert(cur);
+            hasComparison = hasComparison || isComparison;
             if (isLink(bf) && !guard.contains(bf)) {
                 cur = bf; // fall-through is the next link
                 continue;
@@ -4085,6 +4152,7 @@ std::optional<ASTLifter::OrChainInfo> ASTLifter::DetectOrChain(uint32_t headerId
         if (bf == body) {
             links.push_back({cur, true}); // inverted final term: false edge reaches body
             guard.insert(cur);
+            hasComparison = hasComparison || isComparison;
             elseIdx = bt;
             invertedFinal = true;
             break;
@@ -4092,7 +4160,9 @@ std::optional<ASTLifter::OrChainInfo> ASTLifter::DetectOrChain(uint32_t headerId
         break; // does not share the body → end of (non-)chain
     }
 
-    if (!invertedFinal || links.size() < 2 || elseIdx == static_cast<uint32_t>(-1))
+    // require at least one comparison link: a pure-truthiness run that still matched the shape is more
+    // safely left to the existing structuring/value folders than coalesced here.
+    if (!invertedFinal || links.size() < 2 || elseIdx == static_cast<uint32_t>(-1) || !hasComparison)
         return std::nullopt;
 
     // Structure confirmed. Lift each link's condition (the condition under which it

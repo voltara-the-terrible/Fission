@@ -2,6 +2,8 @@
 // Created by Dottik on 8/6/2026.
 //
 // Removes `local X = <pure expr>` when X is never read again. Pure-only, so no effect is lost.
+// Also removes a dead `local function f` (a closure literal is pure — creation has no side
+// effects), so an unused local helper the compiler kept in the bytecode is dropped.
 //
 
 #pragma once
@@ -16,6 +18,18 @@ class DeadLocalEliminator : public ASTRewriter {
     void RewriteStatements(std::vector<std::shared_ptr<Statement>> &stmts) override {
         // back-to-front, since removing a local can leave an earlier one dead.
         for (size_t i = stmts.size(); i-- > 0;) {
+            // dead `local function f`: drop it when `f` is referenced nowhere after its declaration.
+            // a recursive self-reference in its own body counts as a use (keep — conservative).
+            if (auto fd = std::dynamic_pointer_cast<FunctionDeclarationNode>(stmts[i]); fd && fd->bIsLocalDeclaration && !fd->functionName.empty()) {
+                const std::string &fname = fd->functionName;
+                bool used = fd->lpFunctionBody && MentionsBlock(fd->lpFunctionBody, fname);
+                for (size_t j = i + 1; j < stmts.size() && !used; ++j)
+                    used = MentionsStatement(stmts[j], fname);
+                if (!used)
+                    stmts.erase(stmts.begin() + static_cast<std::ptrdiff_t>(i));
+                continue;
+            }
+
             auto decl = std::dynamic_pointer_cast<VariableDeclarationNode>(stmts[i]);
             std::string name;
             if (!decl || !SimpleLocalName(decl, name) || !IsPure(decl->value))
@@ -57,6 +71,11 @@ class DeadLocalEliminator : public ASTRewriter {
                     return false;
             return true;
         }
+        // a closure literal (`local x = function() ... end`) is pure: creating it has no side
+        // effects, only calling it does. The body cannot reference x (not in scope), so it is safe
+        // to drop when unused.
+        if (std::dynamic_pointer_cast<FunctionDeclarationNode>(e))
+            return true;
         return false;
     }
 

@@ -1602,3 +1602,103 @@ TEST_CASE("Scopes: statements between scopes stay at the enclosing level", "[Dec
     // foo() stays between the two blocks at column 0 (enclosing), not indented inside the second.
     CHECK(ContainsRegex(out, std::regex(R"(\nfoo\()")));
 }
+
+// -------------------------------------------------------------------------
+// GETTABLEN numeric index reconstruction (was: bare undefined variable)
+// -------------------------------------------------------------------------
+// Known bug: a single-use GETTABLEN result (`t[1]`, a small constant index) was
+// neither inlined nor declared — LiftExpression's member-chain walk had no
+// GETTABLEN case, so it emitted a bare `vN` that nothing assigned. The Lua index
+// must be C+1, rendered as a plain number (not the `Ni` native-integer literal,
+// which does not parse as a table index in standard Luau).
+TEST_CASE("Regress: GETTABLEN numeric index reconstructs as t[n]", "[Decompiler][Index][Regression]") {
+    const auto out = DecompileOrFail(R"(
+        local function f(t)
+            return t[1] + t[2] + t[3]
+        end
+        return f
+    )");
+
+    INFO("decompile:\n" << out);
+    CHECK(Contains(out, "[1]"));
+    CHECK(Contains(out, "[2]"));
+    CHECK(Contains(out, "[3]"));
+    // never the native-integer literal form in an index position.
+    CHECK_FALSE(Contains(out, "[1i]"));
+    // the three indexed reads are summed; no bare undefined temp left dangling.
+    CHECK(Contains(out, "+"));
+}
+
+// -------------------------------------------------------------------------
+// Guard-chain collapse: `if a and b and c` (D2)
+// -------------------------------------------------------------------------
+// Luau lowers a conjunction guard into nested single-condition ifs; the
+// GuardChainCollapser re-folds `if a then if b then if c then S end end end`
+// back into one compound `if a and b and c then S end`.
+TEST_CASE("Regress: nested and-guard chain collapses to one compound condition", "[Decompiler][ControlFlow][Regression]") {
+    // Inside a loop the guard's fall-through is the latch (shared continuation), not a return, so the
+    // conjunction lowers to the positive nested-if form `if a then if b then if c then S end end end`
+    // that the GuardChainCollapser folds — the same shape the viewmodel's in-loop equip guard takes.
+    const auto out = DecompileOrFail(R"(
+        local function f(items, a, b, c)
+            local n = 0
+            for _, v in items do
+                if a and b and c then
+                    n = n + 1
+                end
+            end
+            return n
+        end
+        return f
+    )");
+
+    INFO("decompile:\n" << out);
+    // one compound condition with two `and`s, not three nested ifs.
+    CHECK(ContainsRegex(out, std::regex(R"(if\s+\w+\s+and\s+\w+\s+and\s+\w+\s+then)")));
+}
+
+// -------------------------------------------------------------------------
+// or-within-and guard: `if a and (not x or y) then` (D3)
+// -------------------------------------------------------------------------
+// Known bug: a mixed truthiness+comparison OR term inside an AND guard
+// (`... and (not t.max or t.dur > 0)`) was not detected as an OR-chain, so the
+// guard was dropped and the body ran unconditionally. The OR must survive inside
+// the if condition.
+TEST_CASE("Regress: or-within-and guard keeps the disjunction in the condition", "[Decompiler][ControlFlow][Regression]") {
+    const auto out = DecompileOrFail(R"(
+        local function f(a, t)
+            if a and (not t.max or t.dur > 0) then
+                return 1
+            end
+            return 0
+        end
+        return f
+    )");
+
+    INFO("decompile:\n" << out);
+    // the disjunction is reconstructed inside an if condition (not dropped, body not unconditional).
+    CHECK(ContainsRegex(out, std::regex(R"(if[^\n]*\bor\b[^\n]*then)")));
+    CHECK(CountOccurrences(out, "return 1") == 1);
+}
+
+// -------------------------------------------------------------------------
+// Dead `local function` elimination
+// -------------------------------------------------------------------------
+// The compiler keeps an unused local function in the bytecode (a DUPCLOSURE whose
+// result register is never read). A closure literal is pure, so a `local function`
+// referenced nowhere after its declaration is dead and must be dropped — the
+// orphan `anon_*` helper the viewmodel left behind.
+TEST_CASE("Regress: dead local function is eliminated", "[Decompiler][DeadCode][Regression]") {
+    const auto out = DecompileOrFail(R"(
+        local function dropMe() return 222 end
+        local function keepMe() return 111 end
+        return keepMe
+    )");
+
+    INFO("decompile:\n" << out);
+    // the referenced function survives...
+    CHECK(Contains(out, "111"));
+    // ...the unreferenced one is gone.
+    CHECK_FALSE(Contains(out, "222"));
+    CHECK_FALSE(Contains(out, "dropMe"));
+}

@@ -5,7 +5,9 @@
 
 #include "AbstractSyntaxTree/Nodes/CommentNode.hpp"
 #include "Analysis/RobloxTypeInferer.hpp"
+#include "Rewriters/BranchTailMerger.hpp"
 #include "Rewriters/DeadLocalEliminator.hpp"
+#include "Rewriters/GuardChainCollapser.hpp"
 #include "Rewriters/IfChainSimplifier.hpp"
 #include "Rewriters/MoveCoalescer.hpp"
 #include "Rewriters/NilGuardFieldNamer.hpp"
@@ -757,6 +759,14 @@ DecompilationResult Decompiler::CommonDecompilerEntryImpl(const std::string &byt
       const auto shortCircuitStart = std::chrono::steady_clock::now();
       ShortCircuitFolder{}.Run(liftedAST.statements);
       const auto shortCircuitEnd = std::chrono::steady_clock::now();
+      // Undo the lifter's tail duplication for return-merged diamonds (the dominant output bloat).
+      // After ShortCircuitFolder (value diamonds folded) and before the auto-namer, so duplicated
+      // copies still carry identical register names and render identically.
+      BranchTailMerger{}.Run(liftedAST.statements);
+      // Collapse `if A then if B then S end end` guard chains into `if A and B then S` BEFORE the
+      // IfChainSimplifier turns else-arms into elseif chains. Runs after ShortCircuitFolder so value
+      // diamonds are already folded and never present this shape.
+      GuardChainCollapser{}.Run(liftedAST.statements);
       const auto ifChainStart = std::chrono::steady_clock::now();
       IfChainSimplifier{}.Run(liftedAST.statements);
       const auto ifChainEnd = std::chrono::steady_clock::now();
