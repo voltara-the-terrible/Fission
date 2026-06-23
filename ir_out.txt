@@ -1,0 +1,49 @@
+/* Fission IR Viewer */
+/* Created by Fission Contributors */
+    /* Program Root (Main Procedure/Prototype/Function) */
+    /* Function Name: '_start' */
+    /* Basic Blocks: 4 */
+
+      BLOCK_0:
+        Type: IfHeader
+        Terminator: Conditional
+        Predecessors: []
+        Successors:   [1, 2]
+        Code:
+          _0: PREPVARARGS 0x0
+          _1: GETIMPORT R1, K1, AUXV_1073741824 /* INFO: Index Chain 'a' */
+          _2: NOP  /* INFO: padding due to the original instruction requiring an auxiliary. */
+          _3: JUMPIFNOT R1, 0x3
+
+      BLOCK_1:
+        Type: IfHeader
+        Terminator: Conditional
+        Predecessors: [0]
+        Successors:   [3, 2]
+        Code:
+          _4: GETIMPORT R0, K3, AUXV_1075838976 /* INFO: Index Chain 'b' */
+          _5: NOP  /* INFO: padding due to the original instruction requiring an auxiliary. */
+          _6: JUMPIF R0, 0x2
+
+      BLOCK_2:
+        Type: Standard
+        Terminator: Fallthrough
+        Predecessors: [0, 1]
+        Successors:   [3]
+        Code:
+          _7: GETIMPORT R0, K5, AUXV_1077936128 /* INFO: Index Chain 'c' */
+          _8: NOP  /* INFO: padding due to the original instruction requiring an auxiliary. */
+
+      BLOCK_3:
+        Type: Return
+        Terminator: Return
+        Predecessors: [1, 2]
+        Successors:   []
+        Code:
+          _9: GETIMPORT R1, K7, AUXV_1080033280 /* INFO: Index Chain 'print' */
+          _10: NOP  /* INFO: padding due to the original instruction requiring an auxiliary. */
+          _11: MOVE R2, R0
+          _12: CALL R1, 0x2, 0x1 /* INFO: Calling function at R1 with 1 argument (R2), expecting no arguments as a return. */
+          _13: RETURN R0, 0x1
+
+    /* There are no nested functions inside of this function. */

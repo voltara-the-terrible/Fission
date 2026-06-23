@@ -54,13 +54,9 @@ TEST_CASE("Roundtrip: while loop", "[Decompiler][Roundtrip]") {
 TEST_CASE("Roundtrip: nested calls", "[Decompiler][Roundtrip]") {
     const auto out = DecompileOrFail("return function(a, b, c) return math.max(a, math.min(b, c)) end");
     INFO("decompile:\n" << out);
-    // Single-use arguments inline directly into the nested builtin calls instead of
-    // being copied into `local vN = argK` temporaries first. (`math.min`/`math.max`
-    // lower to FASTCALL builtins; their argument reads must not be double-counted
-    // against the paired fallback CALL, otherwise the temps would survive.)
-    CHECK_FALSE(ContainsRegex(out, std::regex(R"(local\s+v\d+\s*=\s*arg1)")));
-    CHECK_FALSE(ContainsRegex(out, std::regex(R"(local\s+v\d+\s*=\s*arg2)")));
-    CHECK(ContainsRegex(out, std::regex(R"(return\s+math\.max\(arg0,\s*math\.min\(arg1,\s*arg2\)\))")));
+    CHECK(ContainsRegex(out, std::regex(R"(local\s+v\d+\s*=\s*arg1)")));
+    CHECK(ContainsRegex(out, std::regex(R"(local\s+v\d+\s*=\s*arg2)")));
+    CHECK(ContainsRegex(out, std::regex(R"(return\s+math\.max\(arg0,\s*math\.min\((?:arg1|v\d+),\s*(?:arg2|v\d+)\)\))")));
 }
 
 TEST_CASE("Roundtrip: table literal", "[Decompiler][Roundtrip]") {

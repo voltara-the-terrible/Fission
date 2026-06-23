@@ -230,9 +230,6 @@ struct AnalyzedFunction {
 
     std::unordered_map<int, std::string> globalRegNames;
     std::unordered_map<SSARef, std::string> ssaOverrides;
-    // parent-forced register names (e.g. a method's first parameter renamed to `self`).
-    // separate from globalRegNames since PopulateNames() clears those before the sub-lift.
-    std::unordered_map<int, std::string> globalRegNameOverrides;
 
     // suffix so our own vN/argN don't shadow a captured upvalue's vN when rendered inline. set by parent; empty for root.
     std::string nameSuffix;
@@ -240,8 +237,6 @@ struct AnalyzedFunction {
     std::unordered_map<std::string, std::string> disambiguatedNames;
 
     void SetGlobalName(int32_t reg, const std::string &name) { globalRegNames[reg] = name; }
-    // forced name that survives PopulateNames (set by the parent before a sub-lift).
-    void SetGlobalNameOverride(int32_t reg, const std::string &name) { globalRegNameOverrides[reg] = name; }
 
     void SetVariableName(int32_t reg, int32_t version, const std::string &name) { variableNames[{static_cast<uint8_t>(reg), version}] = name; }
 
@@ -270,8 +265,6 @@ struct AnalyzedFunction {
 
     std::string GetVarName(int32_t reg, int32_t version) {
         SSARef ref{static_cast<uint8_t>(reg), version};
-        if (this->globalRegNameOverrides.contains(reg))
-            return this->globalRegNameOverrides.at(reg);
         if (this->ssaOverrides.contains(ref))
             return this->ssaOverrides.at(ref);
 

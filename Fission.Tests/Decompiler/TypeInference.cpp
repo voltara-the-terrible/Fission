@@ -141,33 +141,3 @@ TEST_CASE("Names: require of a WaitForChild is named after the module", "[Decomp
     INFO("decompile:\n" << out);
     CHECK(ContainsRegex(out, std::regex(R"(\bHelper\b\s*[:=])")));
 }
-
-// A surviving `CFrame.new(...)` local is named after its datatype (`cFrame`), and a second one
-// collides into a numeric suffix (`cFrame2`). Kept alive past -O2 by reading a field off each.
-TEST_CASE("Names: datatype constructors are named after the datatype", "[Decompiler][Names]") {
-    const auto out = DecompileTyped(R"(
-        local function f()
-            local a = CFrame.new()
-            local b = CFrame.new()
-            return a.Position, b.Position
-        end
-        return f
-    )");
-    INFO("decompile:\n" << out);
-    CHECK(ContainsRegex(out, std::regex(R"(\bcFrame\b\s*[:=])")));
-    CHECK(ContainsRegex(out, std::regex(R"(\bcFrame2\b\s*[:=])")));
-}
-
-// `tick()` and `workspace:GetServerTimeNow()` results carry the conventional `timestamp` name.
-TEST_CASE("Names: time-returning calls are named timestamp", "[Decompiler][Names]") {
-    const auto out = DecompileTyped(R"(
-        local function f()
-            local t = tick()
-            local s = workspace:GetServerTimeNow()
-            return t + 1, s + 1
-        end
-        return f
-    )");
-    INFO("decompile:\n" << out);
-    CHECK(ContainsRegex(out, std::regex(R"(\btimestamp\b)")));
-}

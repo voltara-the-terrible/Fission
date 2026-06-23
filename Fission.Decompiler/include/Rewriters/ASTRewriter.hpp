@@ -28,11 +28,10 @@ class ASTRewriter {
                     RewriteBlock(ifS->thenBranch->body);
                 if (ifS->elseBranch)
                     RewriteBlock(ifS->elseBranch->body);
-            } else if (auto blk = std::dynamic_pointer_cast<BlockStatementNode>(stmt)) {
-                // reconstructed `do ... end` scope: descend so folds/cleanups run inside it.
-                RewriteBlock(blk->body);
             } else if (auto fn = std::dynamic_pointer_cast<FunctionDeclarationNode>(stmt); fn && fn->lpFunctionBody) {
                 RewriteBlock(fn->lpFunctionBody->body);
+            } else if (auto doB = std::dynamic_pointer_cast<DoBlockNode>(stmt); doB && doB->body) {
+                RewriteBlock(doB->body->body);
             } else if (auto w = std::dynamic_pointer_cast<WhileStatementNode>(stmt); w && w->body) {
                 RewriteBlock(w->body->body);
             } else if (auto r = std::dynamic_pointer_cast<RepeatStatementNode>(stmt); r && r->body) {
@@ -74,6 +73,10 @@ class ASTRewriter {
             RewriteExpression(bin->right);
         } else if (auto un = std::dynamic_pointer_cast<UnaryExpressionNode>(expr)) {
             RewriteExpression(un->operand);
+        } else if (auto ie = std::dynamic_pointer_cast<IfElseExpressionNode>(expr)) {
+            RewriteExpression(ie->condition);
+            RewriteExpression(ie->thenExpr);
+            RewriteExpression(ie->elseExpr);
         } else if (auto tbl = std::dynamic_pointer_cast<TableLiteralNode>(expr)) {
             for (auto &e : tbl->expressions)
                 RewriteExpression(e);

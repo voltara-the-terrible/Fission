@@ -26,6 +26,7 @@ class RobloxTypeInferer : public Visitor {
     void Visit(BreakStatementNode *lpNode) override;
     void Visit(ContinueStatementNode *lpNode) override;
     void Visit(BlockStatementNode *lpNode) override;
+    void Visit(DoBlockNode *lpNode) override;
     void Visit(WhileStatementNode *lpNode) override;
     void Visit(IfStatementNode *lpNode) override;
     void Visit(AssignmentStatementNode *lpNode) override;
@@ -39,6 +40,7 @@ class RobloxTypeInferer : public Visitor {
     void Visit(NilLiteralNode *lpNode) override;
     void Visit(TableLiteralNode *lpNode) override;
     void Visit(NoExpressionNode *lpNode) override;
+    void Visit(IfElseExpressionNode *lpNode) override;
     void Visit(NameCallExpressionNode *lpNode) override;
     void Visit(ForNumericNode *lpNode) override;
     void Visit(ForGeneralNode *lpNode) override;
@@ -55,11 +57,9 @@ class RobloxTypeInferer : public Visitor {
     std::unordered_map<std::string, std::string> m_renames;
     std::set<std::string> m_names;
     std::set<std::string> m_autoNames;
+    int32_t m_autoNameCounter = 0;
     bool m_inferTypes = true;
     bool m_autoNameVariables = false;
-    // set by an assignment of a closure to a table member (`T.x = function ...`), consumed by the
-    // immediately-following function visit so its first parameter is renamed to `self`.
-    bool m_methodSelfHint = false;
 
     static std::shared_ptr<Expression> MakeTypeAnnotation(const std::string &typeName);
     static std::optional<std::string> IdentifierName(const std::shared_ptr<Expression> &expr);

@@ -6,7 +6,6 @@
 #include "AbstractSyntaxTree/ASTNode.hpp"
 #include "ControlFlowAnalyzer.hpp"
 #include "Deserializer.hpp"
-#include "DecompilerFlags.hpp"
 #include "lua.h"
 
 #include <memory>
@@ -16,37 +15,36 @@
 #include <vector>
 
 struct ASTFunction {
-        AnalyzedFunction *backingFunction = nullptr; // not owned by ASTFunction
-        std::vector<std::shared_ptr<Statement>> statements;
+    AnalyzedFunction *backingFunction = nullptr; // not owned by ASTFunction
+    std::vector<std::shared_ptr<Statement>> statements;
 
-        std::vector<ASTFunction> subFunctions;
+    std::vector<ASTFunction> subFunctions;
 };
 
 class ASTLifter {
-    public:
-        std::shared_ptr<Expression> InvertCondition(const std::shared_ptr<Expression> &cond);
-        explicit ASTLifter();
+  public:
+    std::shared_ptr<Expression> InvertCondition(const std::shared_ptr<Expression> &cond);
+    explicit ASTLifter();
 
-        DecompilerFlags m_flags;
-        ASTFunction Lift(AnalyzedFunction &analyzedFunction, DecompilerFlags flags);
-        std::shared_ptr<Expression> LiftCondition(const LiftedInstruction *inst);
+    ASTFunction Lift(AnalyzedFunction &analyzedFunction);
+    std::shared_ptr<Expression> LiftCondition(const LiftedInstruction *inst);
 
-        std::unordered_set<int32_t> m_definedRegisters;
-        std::unordered_set<int32_t> m_pinnedRegisters;
+    std::unordered_set<int32_t> m_definedRegisters;
+    std::unordered_set<int32_t> m_pinnedRegisters;
 
-        std::unordered_set<int32_t> m_processedInstructions;
+    std::unordered_set<int32_t> m_processedInstructions;
 
-        struct PinnedRegisterScope {
-            ASTLifter *m_lpLifter;
-            int32_t dwReg;
+    struct PinnedRegisterScope {
+        ASTLifter *m_lpLifter;
+        int32_t dwReg;
 
-            PinnedRegisterScope(ASTLifter *lifter, int32_t reg) : m_lpLifter(lifter), dwReg(reg) { m_lpLifter->m_pinnedRegisters.insert(reg); }
+        PinnedRegisterScope(ASTLifter *lifter, int32_t reg) : m_lpLifter(lifter), dwReg(reg) { m_lpLifter->m_pinnedRegisters.insert(reg); }
 
-            ~PinnedRegisterScope() { m_lpLifter->m_pinnedRegisters.erase(dwReg); }
+        ~PinnedRegisterScope() { m_lpLifter->m_pinnedRegisters.erase(dwReg); }
 
-            PinnedRegisterScope(const PinnedRegisterScope &) = delete;
-            PinnedRegisterScope &operator=(const PinnedRegisterScope &) = delete;
-        };
+        PinnedRegisterScope(const PinnedRegisterScope &) = delete;
+        PinnedRegisterScope &operator=(const PinnedRegisterScope &) = delete;
+    };
 
     std::set<SSARef> m_phiConsumers;
 
@@ -60,6 +58,10 @@ class ASTLifter {
     std::unordered_map<std::string, DeserializedFunction *> m_takenFunctionNames;
     int32_t m_dwLastFunctionIndex = 0;
 
+    // When set, value-materialisation diamonds/chains render as `if c then A else B` /
+    // `if .. elseif .. else` expressions instead of the default `a and A or b and B or C` form.
+    bool m_useIfElseExpressions = false;
+
   private:
     AnalyzedFunction *m_currentFunction = nullptr;
 
@@ -70,16 +72,6 @@ class ASTLifter {
     std::vector<uint32_t> m_loopExitStack;
 
     std::vector<std::shared_ptr<Statement>> LiftControlFlow(uint32_t currentBlockId, uint32_t stopBlockId, std::set<uint32_t> &visited);
-
-    // Recover `do ... end` lexical scopes from register reuse. The Luau register allocator
-    // only reuses a register slot for a fresh `local` once the previous occupant's lexical
-    // scope has closed, so in straight-line code a register reused by a later materialized
-    // local is the signature of a closed block. Wraps each recovered scope in a
-    // BlockStatementNode with bIsScopeBlock = true. `minBaseReg` is the floor below which a
-    // register cannot anchor a new scope (set when recursing into an already-recovered block
-    // so deeper nesting only fires on strictly higher registers). Heuristic only — never uses
-    // locvar debug info. Conservative by design: when in doubt it leaves statements untouched.
-    void ReconstructScopes(std::vector<std::shared_ptr<Statement>> &stmts, int32_t minBaseReg);
     std::string GetFunctionName(DeserializedFunction *lpDeserialized) {
         if (lpDeserialized->debugName.has_value())
             return std::format("{}", *lpDeserialized->debugName);
@@ -90,6 +82,21 @@ class ASTLifter {
     }
 
     std::vector<std::shared_ptr<Statement>> LiftBlockInstructions(const BasicBlock &block, bool forceDefinitions = false);
+
+    // Straight-line `do ... end` detection. The compiler frees a block's locals at `end`, so the
+    // register-stack top resets and the registers are reused after. ComputeDoScopes finds those
+    // reuse-confirmed register-stack excursions; GroupDoScopes wraps the statements that fall in each
+    // interval into a DoBlockNode. stmtMarks maps a produced statement's flat index to its source
+    // instruction (recorded during LiftBlockInstructions).
+    struct DoScopeInterval {
+        int start;  // first instruction index in the scope
+        int end;    // last instruction index in the scope
+        std::unordered_set<int> localRegs; // registers whose whole live range is inside the scope
+    };
+    std::vector<DoScopeInterval> ComputeDoScopes(const BasicBlock &block, const std::vector<std::pair<int, size_t>> &stmtMarks,
+                                                 const std::vector<std::shared_ptr<Statement>> &statements);
+    std::vector<std::shared_ptr<Statement>> GroupDoScopes(const BasicBlock &block, std::vector<std::shared_ptr<Statement>> statements,
+                                                          const std::vector<std::pair<int, size_t>> &stmtMarks);
     bool CanReach(uint32_t start, uint32_t target, uint32_t stopBlock, const std::set<uint32_t> &visitedScopes);
     std::shared_ptr<Expression> LiftExpression(const LiftedOperand &operand, bool forceExpression = false);
     std::shared_ptr<Expression> LiftCall(const LiftedInstruction &inst, int32_t instructionIndex, bool isNested);
@@ -118,6 +125,24 @@ class ASTLifter {
     // negation). Returns nullopt when the shape does not match. On success the
     // two boolean loads are marked processed.
     std::optional<BoolMaterialization> DetectBooleanMaterialization(uint32_t headerId);
+
+    // Result of recognising a Luau `if <cond> then A else B` *expression*. The compiler lowers it to
+    // a diamond whose two branches each assign one register a value and then merge. Without this the
+    // diamond reads as a statement `if`, and (when the merge is a return block) the merge code gets
+    // duplicated into both arms. Collapses to a single `Rd = if cond then A else B`.
+    struct IfElseMaterialization {
+        std::shared_ptr<Statement> assignment; // `Rd = if cond then A else B`
+        uint32_t continueBlock;                // merge block to keep lifting from
+        std::vector<uint32_t> consumedBlocks;  // branch blocks to mark visited (their code is now in the expression)
+    };
+    std::optional<IfElseMaterialization> DetectIfElseExpression(uint32_t headerId);
+
+    // `local x = a and P or b and Q or ... or Z` lowers to a *chain* of value diamonds that all
+    // materialise one register and merge at a single point (so the merge has 3+ predecessors).
+    // Reconstructs the short-circuit `and`/`or` expression. Reuses IfElseMaterialization as the
+    // carrier (assignment + merge block + consumed branch blocks). A plain 2-way diamond is left to
+    // DetectIfElseExpression (which renders the `if cond then A else B` expression form instead).
+    std::optional<IfElseMaterialization> DetectShortCircuitChain(uint32_t headerId);
 
     // A short-circuit OR-chain that Luau lowers into a run of IfHeaders all
     // branching to one shared `then` body (`if a or b or c then BODY else ELSE`).
