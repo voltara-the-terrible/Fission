@@ -30,7 +30,6 @@ class VariableDeclarationNode;
 class NilLiteralNode;
 class TableLiteralNode;
 class NoExpressionNode;
-class IfElseExpressionNode;
 class NameCallExpressionNode;
 class ForNumericNode;
 class ForGeneralNode;
@@ -70,7 +69,6 @@ class Visitor {
     virtual void Visit(NilLiteralNode *lpNode) = 0;
     virtual void Visit(TableLiteralNode *lpNode) = 0;
     virtual void Visit(NoExpressionNode *lpNode) = 0;
-    virtual void Visit(IfElseExpressionNode *lpNode) = 0;
     virtual void Visit(NameCallExpressionNode *lpNode) = 0;
     virtual void Visit(ForNumericNode *lpNode) = 0;
     virtual void Visit(ForGeneralNode *lpNode) = 0;

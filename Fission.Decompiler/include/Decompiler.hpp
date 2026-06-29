@@ -5,10 +5,21 @@
 #include "BytecodeLifter.hpp"
 #include "ControlFlowAnalyzer.hpp"
 #include "Deserializer.hpp"
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wunused-parameter"
+#if defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-parameter"
+#endif
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4100)
+#endif
 #include "Luau/Compiler.h"
-#pragma clang diagnostic pop
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
+#if defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
 #include "ASTLifter.hpp"
 #include "SSABuilder.hpp"
 #include "SourceGenerator/Generator.hpp"
@@ -31,12 +42,7 @@ enum class DecompilerFlags : uint16_t {
     InferRobloxTypes = 1 << 7,
     AutoNameVariables = 1 << 8,
     // drop Fission's info comments (function info, capture/name notes). warnings + banner still emitted.
-    OmitFissionComments = 1 << 9,
-    // render value-materialisation diamonds/chains as `if c then A else B` / `if .. elseif .. else`
-    // expressions instead of the default `a and A or b and B or C` short-circuit form.
-    UseIfElseExpressions = 1 << 10,
-    // annotate each lifted statement with its source `--[[ Line: .., Register: .., OpCode: .. ]]`.
-    DebugInfo = 1 << 11
+    OmitFissionComments = 1 << 9
 };
 
 constexpr DecompilerFlags operator|(DecompilerFlags lhs, DecompilerFlags rhs) {
@@ -68,9 +74,9 @@ struct DecompilationResult {
 class Decompiler {
     Deserializer deserializer{};
     ControlFlowAnalyzer controlFlowAnalyzer{};
-    SSABuilder SSABuilder{};
-    ASTLifter ASTLifter{};
-    SourceGenerator SourceGenerator{};
+    SSABuilder ssaBuilder{};
+    ASTLifter astLifter{};
+    SourceGenerator sourceGenerator{};
     GraphVisualizer visualizer{};
 
     DecompilationResult CommonDecompilerEntry(const std::string &bytecode, Fission::InstructionDecoder *decoder, DecompilerFlags flags);
@@ -84,7 +90,5 @@ class Decompiler {
         const std::string &fileName, DecompilerFlags flags = static_cast<DecompilerFlags>(0), const Luau::CompileOptions &compileOpts = {1, 2}
     );
     DecompilationResult DecompileRobloxBytecode(const std::string &bytecode, DecompilerFlags flags = static_cast<DecompilerFlags>(0));
-    // decompiles raw, standard (unencoded) Luau bytecode in memory, e.g. the output of luau_compile/Luau::compile.
-    DecompilationResult DecompileLuauBytecode(const std::string &bytecode, DecompilerFlags flags = static_cast<DecompilerFlags>(0));
     DecompilationResult DecompileRobloxBytecodeFromFile(const std::string &fileName, DecompilerFlags flags = static_cast<DecompilerFlags>(0));
 };

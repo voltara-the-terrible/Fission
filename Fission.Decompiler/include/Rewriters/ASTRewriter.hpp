@@ -71,10 +71,6 @@ class ASTRewriter {
             RewriteExpression(bin->right);
         } else if (auto un = std::dynamic_pointer_cast<UnaryExpressionNode>(expr)) {
             RewriteExpression(un->operand);
-        } else if (auto ie = std::dynamic_pointer_cast<IfElseExpressionNode>(expr)) {
-            RewriteExpression(ie->condition);
-            RewriteExpression(ie->thenExpr);
-            RewriteExpression(ie->elseExpr);
         } else if (auto tbl = std::dynamic_pointer_cast<TableLiteralNode>(expr)) {
             for (auto &e : tbl->expressions)
                 RewriteExpression(e);

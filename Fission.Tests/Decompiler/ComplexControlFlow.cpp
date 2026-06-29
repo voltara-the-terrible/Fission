@@ -527,29 +527,3 @@ TEST_CASE("CCF: generic-for with conditional skip", "[Decompiler][ControlFlow][L
     CHECK(CountSubstr(out, "finish(") == 1);
     CHECK(CountWord(out, "break") == 1);
 }
-
-// An if/else whose arms reconverge on a tail ending in `return` lifts with the merge block
-// duplicated into both arms (the "return blocks may be duplicated" rule). BranchTailHoister must
-// pull that shared tail back out so it renders once, not three times.
-TEST_CASE("CCF: shared if/else tail before a return is hoisted, not duplicated", "[Decompiler][ShortCircuit]") {
-    const auto out = DecompileOrFail(R"(
-        local function f(a, b)
-            if a then
-                b.x = 1
-            else
-                b.x = 2
-            end
-            b.y = 3
-            print(b)
-            return b
-        end
-        return f
-    )",
-        2);
-    INFO("decompile:\n" << out);
-    // The tail (`b.y = 3`, `print(b)`, `return b`) must appear exactly once.
-    CHECK(CountSubstr(out, "print(") == 1);
-    CHECK(CountSubstr(out, ".y = 3") == 1);
-    // ...but the conditional itself is preserved.
-    CHECK(CountWord(out, "else") == 1);
-}

@@ -94,40 +94,10 @@ class SourceGenerator : public Visitor {
 
     void Visit(NoExpressionNode *lpNode) override { (void)lpNode; }
 
-    void Visit(IfElseExpressionNode *lpNode) override {
-        buffer << "if ";
-        lpNode->condition->Accept(this);
-        buffer << " then ";
-        lpNode->thenExpr->Accept(this);
-        // collapse a chain of nested else-ifs into `elseif` rather than `else if ... else if ...`.
-        IfElseExpressionNode *cur = lpNode;
-        while (auto nested = std::dynamic_pointer_cast<IfElseExpressionNode>(cur->elseExpr)) {
-            buffer << " elseif ";
-            nested->condition->Accept(this);
-            buffer << " then ";
-            nested->thenExpr->Accept(this);
-            cur = nested.get();
-        }
-        buffer << " else ";
-        cur->elseExpr->Accept(this);
-    }
-
-    // trailing `--[[ Line/Register/OpCode ]]` comment for a statement, when DebugInfo tagged it.
-    // The statement has just been emitted and ends with a newline; overwrite that newline so the
-    // comment sits at the end of the same line.
-    void EmitDebugAnnotation(ASTNode *node) {
-        if (!node || !node->debugAnnotation)
-            return;
-        buffer.seekp(-1, std::ios_base::end);
-        buffer << " --[[ " << *node->debugAnnotation << " ]]\n";
-    }
-
     void Visit(RootNode *lpNode) override {
         (void)lpNode;
-        for (const auto &body : lpNode->programBody) {
+        for (const auto &body : lpNode->programBody)
             body->Accept(this);
-            EmitDebugAnnotation(body.get());
-        }
     }
 
     void Visit(Identifier *lpNode) override { buffer << lpNode->name; }
@@ -143,17 +113,6 @@ class SourceGenerator : public Visitor {
                 buffer << ", ";
             buffer << "...";
         }
-    }
-
-    // a function literal in callee position must be parenthesised, otherwise
-    // `function(...) ... end(args)` is a syntax error: emit `(function(...) ... end)(args)`.
-    void EmitCallee(const std::shared_ptr<Expression> &callee) {
-        const bool wrap = std::dynamic_pointer_cast<FunctionDeclarationNode>(callee) != nullptr;
-        if (wrap)
-            buffer << "(";
-        callee->Accept(this);
-        if (wrap)
-            buffer << ")";
     }
 
     void Visit(FunctionDeclarationNode *lpNode) override {
@@ -252,7 +211,7 @@ class SourceGenerator : public Visitor {
                 }
                 buffer << " = ";
             }
-            EmitCallee(lpNode->callee);
+            lpNode->callee->Accept(this);
             buffer << "(";
             for (size_t i = 0; i < lpNode->arguments.size(); i++) {
                 lpNode->arguments.at(i)->Accept(this);
@@ -263,7 +222,7 @@ class SourceGenerator : public Visitor {
             buffer << ")";
             this->NextLine();
         } else {
-            EmitCallee(lpNode->callee);
+            lpNode->callee->Accept(this);
             buffer << "(";
             for (size_t i = 0; i < lpNode->arguments.size(); i++) {
                 lpNode->arguments.at(i)->Accept(this);
@@ -370,7 +329,6 @@ class SourceGenerator : public Visitor {
         (void)lpNode;
         for (const auto &node : lpNode->body) {
             node->Accept(this);
-            EmitDebugAnnotation(node.get());
         }
     }
 

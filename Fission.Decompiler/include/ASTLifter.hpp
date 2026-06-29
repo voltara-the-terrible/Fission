@@ -58,19 +58,6 @@ class ASTLifter {
     std::unordered_map<std::string, DeserializedFunction *> m_takenFunctionNames;
     int32_t m_dwLastFunctionIndex = 0;
 
-    // When set, value-materialisation diamonds/chains render as `if c then A else B` /
-    // `if .. elseif .. else` expressions instead of the default `a and A or b and B or C` form.
-    bool m_useIfElseExpressions = false;
-
-    // When set, each lifted statement is tagged with its source `Line/Register/OpCode` (emitted by
-    // the generator as a leading `--[[ ... ]]` comment).
-    bool m_emitDebugInfo = false;
-
-    // DebugInfo helpers (used by both LiftBlockInstructions and the value-materialisation detectors).
-    int LineForPc(int pc); // source line for a bytecode PC (== lifted instructionIndex), -1 if unknown
-    std::pair<int, int> RegisterSpanOfBlocks(const std::vector<uint32_t> &blockIds); // {minReg, maxReg} over their instructions
-    void TagDebugAnnotation(const std::shared_ptr<Statement> &stmt, int lineInstr, int minReg, int maxReg, std::string_view op);
-
   private:
     AnalyzedFunction *m_currentFunction = nullptr;
 
@@ -91,7 +78,6 @@ class ASTLifter {
     }
 
     std::vector<std::shared_ptr<Statement>> LiftBlockInstructions(const BasicBlock &block, bool forceDefinitions = false);
-
     bool CanReach(uint32_t start, uint32_t target, uint32_t stopBlock, const std::set<uint32_t> &visitedScopes);
     std::shared_ptr<Expression> LiftExpression(const LiftedOperand &operand, bool forceExpression = false);
     std::shared_ptr<Expression> LiftCall(const LiftedInstruction &inst, int32_t instructionIndex, bool isNested);
@@ -120,24 +106,6 @@ class ASTLifter {
     // negation). Returns nullopt when the shape does not match. On success the
     // two boolean loads are marked processed.
     std::optional<BoolMaterialization> DetectBooleanMaterialization(uint32_t headerId);
-
-    // Result of recognising a Luau `if <cond> then A else B` *expression*. The compiler lowers it to
-    // a diamond whose two branches each assign one register a value and then merge. Without this the
-    // diamond reads as a statement `if`, and (when the merge is a return block) the merge code gets
-    // duplicated into both arms. Collapses to a single `Rd = if cond then A else B`.
-    struct IfElseMaterialization {
-        std::shared_ptr<Statement> assignment; // `Rd = if cond then A else B`
-        uint32_t continueBlock;                // merge block to keep lifting from
-        std::vector<uint32_t> consumedBlocks;  // branch blocks to mark visited (their code is now in the expression)
-    };
-    std::optional<IfElseMaterialization> DetectIfElseExpression(uint32_t headerId);
-
-    // `local x = a and P or b and Q or ... or Z` lowers to a *chain* of value diamonds that all
-    // materialise one register and merge at a single point (so the merge has 3+ predecessors).
-    // Reconstructs the short-circuit `and`/`or` expression. Reuses IfElseMaterialization as the
-    // carrier (assignment + merge block + consumed branch blocks). A plain 2-way diamond is left to
-    // DetectIfElseExpression (which renders the `if cond then A else B` expression form instead).
-    std::optional<IfElseMaterialization> DetectShortCircuitChain(uint32_t headerId);
 
     // A short-circuit OR-chain that Luau lowers into a run of IfHeaders all
     // branching to one shared `then` body (`if a or b or c then BODY else ELSE`).

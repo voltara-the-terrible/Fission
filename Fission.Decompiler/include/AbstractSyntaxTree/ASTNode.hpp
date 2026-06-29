@@ -68,9 +68,6 @@ class ASTNode {
   public:
     virtual ~ASTNode() = default;
     ASTNodeKind nodeKind = ASTNodeKind::Unknown;
-    // Optional source annotation (Line/Register/OpCode), set when DebugInfo is requested and emitted
-    // by the generator as a leading `--[[ ... ]]` comment.
-    std::optional<std::string> debugAnnotation = std::nullopt;
     virtual void Accept(Visitor *visitor) { (void)visitor; }
 };
 
@@ -324,19 +321,6 @@ class FunctionDeclarationNode : public Expression {
 
 class NoExpressionNode : public Expression {
   public:
-    void Accept(Visitor *visitor) override { visitor->Visit(this); }
-};
-
-// Luau `if <cond> then <thenExpr> else <elseExpr>` expression (the value-level if, not a statement).
-// Reconstructed from a diamond whose branches assign one register a value, then merge.
-class IfElseExpressionNode : public Expression {
-  public:
-    std::shared_ptr<Expression> condition;
-    std::shared_ptr<Expression> thenExpr;
-    std::shared_ptr<Expression> elseExpr;
-    IfElseExpressionNode(std::shared_ptr<Expression> condition, std::shared_ptr<Expression> thenExpr, std::shared_ptr<Expression> elseExpr)
-        : condition(std::move(condition)), thenExpr(std::move(thenExpr)), elseExpr(std::move(elseExpr)) {}
-
     void Accept(Visitor *visitor) override { visitor->Visit(this); }
 };
 

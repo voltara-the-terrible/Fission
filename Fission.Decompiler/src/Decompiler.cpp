@@ -5,11 +5,9 @@
 
 #include "AbstractSyntaxTree/Nodes/CommentNode.hpp"
 #include "Analysis/RobloxTypeInferer.hpp"
-#include "Rewriters/BranchTailHoister.hpp"
 #include "Rewriters/DeadLocalEliminator.hpp"
 #include "Rewriters/IfChainSimplifier.hpp"
 #include "Rewriters/ShortCircuitFolder.hpp"
-#include "Rewriters/TwoWayValueDiamondFolder.hpp"
 #include "SafetyGuard.hpp"
 
 #include <libassert/assert.hpp>
@@ -17,10 +15,12 @@
 #include <algorithm>
 #include <chrono>
 #include <filesystem>
+#include <format>
 #include <fstream>
 #include <iostream>
 #include <optional>
 #include <ostream>
+#include <sstream>
 #include <unordered_map>
 
 std::string GetIndentation(int indentationLevel) {
@@ -47,13 +47,6 @@ void PrintFunctionOntoStream(std::stringstream &stream, int indentationLevel, co
 
     stream << GetIndentation(indentationLevel) << "/* Function Name: '" << rawFunc->name << "' */\n";
     stream << GetIndentation(indentationLevel) << "/* Basic Blocks: " << analyzedFunc.basicBlocks.size() << " */\n";
-
-    if (rawFunc->lpDeserialized && !rawFunc->lpDeserialized->locvars.empty()) {
-        stream << GetIndentation(indentationLevel) << "/* Local Variables (debug info): */\n";
-        for (const auto &lv : rawFunc->lpDeserialized->locvars)
-            stream << GetIndentation(indentationLevel + 2) << "/* '" << lv.varname << "' reg=R" << static_cast<int>(lv.reg) << " scope=[" << lv.startpc
-                   << ", " << lv.endpc << ") */\n";
-    }
 
     for (const auto &block : analyzedFunc.basicBlocks) {
         stream << "\n";
@@ -144,7 +137,11 @@ void writefile(const std::filesystem::path &path, const std::string &content) {
 }
 
 std::optional<std::string> readfile(const std::filesystem::path &path, const bool isBinary = false) {
-    std::ifstream file(path, (isBinary ? std::ios::binary : 0) | std::ios::ate);
+    auto mode = std::ios::ate;
+    if (isBinary)
+        mode |= std::ios::binary;
+
+    std::ifstream file(path, mode);
 
     if (!file.is_open())
         return std::nullopt;
@@ -183,10 +180,6 @@ static std::string FormatDecompilerOptions(DecompilerFlags flags) {
         enabled.emplace_back("AutoNameVariables");
     if ((flags & DecompilerFlags::OmitFissionComments) == DecompilerFlags::OmitFissionComments)
         enabled.emplace_back("OmitFissionComments");
-    if ((flags & DecompilerFlags::UseIfElseExpressions) == DecompilerFlags::UseIfElseExpressions)
-        enabled.emplace_back("UseIfElseExpressions");
-    if ((flags & DecompilerFlags::DebugInfo) == DecompilerFlags::DebugInfo)
-        enabled.emplace_back("DebugInfo");
 
     if (enabled.empty())
         return "None";
@@ -712,13 +705,11 @@ DecompilationResult Decompiler::CommonDecompilerEntryImpl(const std::string &byt
     const auto controlFlowAnalyzeEnd = std::chrono::steady_clock::now();
 
     const auto ssaStart = std::chrono::steady_clock::now();
-    SSABuilder.Build(controlFlowAnalyzedFunction);
+    ssaBuilder.Build(controlFlowAnalyzedFunction);
     const auto ssaEnd = std::chrono::steady_clock::now();
 
     const auto astStart = std::chrono::steady_clock::now();
-    ASTLifter.m_useIfElseExpressions = (flags & DecompilerFlags::UseIfElseExpressions) == DecompilerFlags::UseIfElseExpressions;
-    ASTLifter.m_emitDebugInfo = (flags & DecompilerFlags::DebugInfo) == DecompilerFlags::DebugInfo;
-    auto liftedAST = ASTLifter.Lift(controlFlowAnalyzedFunction);
+    auto liftedAST = astLifter.Lift(controlFlowAnalyzedFunction);
     AddDecompilerOptionsToHeader(liftedAST, flags);
 
     // ---- AST Rewriting ----
@@ -729,9 +720,6 @@ DecompilationResult Decompiler::CommonDecompilerEntryImpl(const std::string &byt
     const auto ifChainStart = std::chrono::steady_clock::now();
     IfChainSimplifier{}.Run(liftedAST.statements);
     const auto ifChainEnd = std::chrono::steady_clock::now();
-    const bool useIfElseExpressions = (flags & DecompilerFlags::UseIfElseExpressions) == DecompilerFlags::UseIfElseExpressions;
-    TwoWayValueDiamondFolder{useIfElseExpressions}.Run(liftedAST.statements);
-    BranchTailHoister{}.Run(liftedAST.statements);
     DeadLocalEliminator{}.Run(liftedAST.statements);
     const auto astRewriteEnd = std::chrono::steady_clock::now();
 
@@ -751,17 +739,16 @@ DecompilationResult Decompiler::CommonDecompilerEntryImpl(const std::string &byt
     if (inferRobloxTypes || autoNameVariables)
         RobloxTypeInferer{}.Infer(liftedAST, inferRobloxTypes, autoNameVariables);
     const auto robloxPropagationEnd = std::chrono::steady_clock::now();
-
     const auto astEnd = std::chrono::steady_clock::now();
 
     RootNode root{liftedAST.statements};
 
-    SourceGenerator.bOmitInformationalComments = (flags & DecompilerFlags::OmitFissionComments) == DecompilerFlags::OmitFissionComments;
+    sourceGenerator.bOmitInformationalComments = (flags & DecompilerFlags::OmitFissionComments) == DecompilerFlags::OmitFissionComments;
     const auto sgenStart = std::chrono::steady_clock::now();
-    const auto generator = SourceGenerator.GenerateSource(&root);
+    const auto generator = sourceGenerator.GenerateSource(&root);
     const auto sgenEnd = std::chrono::steady_clock::now();
 
-    //std::println(std::cout, "generated source code:\n{}", generator);
+    std::cout << "generated source code:\n" << generator << '\n';
 
     const auto printIR = (flags & DecompilerFlags::PrintIR) == DecompilerFlags::PrintIR;
     const auto writeIR = (flags & DecompilerFlags::WriteIRToFile) == DecompilerFlags::WriteIRToFile;
@@ -841,11 +828,6 @@ DecompilationResult Decompiler::DecompileTestCodeFromFile(const std::string &fil
 DecompilationResult Decompiler::DecompileRobloxBytecode(const std::string &bytecode, DecompilerFlags flags) {
     auto robloxDecoder = Fission::RobloxClientDecoder{};
     return CommonDecompilerEntry(bytecode, &robloxDecoder, flags);
-}
-
-DecompilationResult Decompiler::DecompileLuauBytecode(const std::string &bytecode, DecompilerFlags flags) {
-    auto normalDecoder = Fission::InstructionDecoder{};
-    return CommonDecompilerEntry(bytecode, &normalDecoder, flags);
 }
 
 DecompilationResult Decompiler::DecompileRobloxBytecodeFromFile(const std::string &fileName, DecompilerFlags flags) {

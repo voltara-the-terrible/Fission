@@ -94,11 +94,11 @@ RobloxTypeInferer::CallReturnType(const std::string &methodName, const std::vect
     if (methodName == "insert" || methodName == "remove" || methodName == "sort" || methodName == "clear")
         return std::nullopt;
     if (methodName == "create" || methodName == "freeze" || methodName == "clone" || methodName == "pack")
-        return "{ [any]: any }";
+        return "table";
     if (methodName == "find")
         return "number";
     if (methodName == "keys" || methodName == "values")
-        return "{ [any]: any }";
+        return "table";
     if (methodName == "concat")
         return "string";
     if (methodName == "maxn" || methodName == "getn")
@@ -143,46 +143,12 @@ RobloxTypeInferer::CallReturnType(const std::string &methodName, const std::vect
 
 std::optional<std::string>
 RobloxTypeInferer::CallAutoName(const std::string &methodName, const std::vector<std::shared_ptr<Expression>> &args, size_t classArgIndex) {
-    // Calls whose result is named after a string argument: the child/service/attribute name
-    // becomes the variable name (`WaitForChild("Humanoid")` -> `Humanoid`,
-    // `GetAttribute("Direction")` -> `Direction`).
     if (methodName == "FindFirstChild" || methodName == "WaitForChild" || methodName == "FindFirstAncestor")
         return ClassArgument(args, classArgIndex);
     if (methodName == "FindFirstChildOfClass" || methodName == "FindFirstChildWhichIsA" || methodName == "GetService" ||
         methodName == "FindFirstAncestorOfClass" || methodName == "FindFirstAncestorWhichIsA")
         return ClassArgument(args, classArgIndex);
-    if (methodName == "GetAttribute")
-        return ClassArgument(args, classArgIndex);
-
-    // Calls whose result is named after the method itself (the arguments carry no name):
-    // `obj:Clone()` -> `clone`, `Player:GetMouse()` -> `Mouse`, `signal:Connect(fn)` -> `connection`.
-    if (methodName == "Clone")
-        return "clone";
-    if (methodName == "GetMouse")
-        return "Mouse";
-    if (methodName == "Connect")
-        return "connection";
     return std::nullopt;
-}
-
-// A plain `table.Field` read names the local after the field. Returns nullopt when the field
-// is not a usable identifier (single character like `.X`/`.p`, leading digit, or non-identifier
-// characters), so those locals keep their generated register name instead of a noisy one.
-std::optional<std::string> RobloxTypeInferer::ConventionalFieldName(const std::string &field) {
-    if (field.size() < 2)
-        return std::nullopt;
-    if (std::isdigit(static_cast<unsigned char>(field.front())))
-        return std::nullopt;
-    for (const auto ch : field)
-        if (!std::isalnum(static_cast<unsigned char>(ch)) && ch != '_')
-            return std::nullopt;
-
-    // Near-universal Roblox idioms read better under their conventional short name.
-    if (field == "LocalPlayer")
-        return "Player";
-    if (field == "CurrentCamera")
-        return "Camera";
-    return field;
 }
 
 std::optional<std::string> RobloxTypeInferer::GlobalFunctionType(const std::string &name, const std::vector<std::shared_ptr<Expression>> &args) {
@@ -205,10 +171,10 @@ std::optional<std::string> RobloxTypeInferer::GlobalFunctionType(const std::stri
         if (args.size() >= 2)
             if (auto secondType = IdentifierName(args[1]); secondType && !IsGeneratedName(*secondType))
                 return *secondType;
-        return "{ [any]: any }";
+        return "table";
     }
     if (name == "require" || name == "newproxy")
-        return "{ [any]: any }";
+        return "table";
     if (name == "next" || name == "pairs" || name == "ipairs")
         return "function";
     if (name == "loadstring")
@@ -216,7 +182,7 @@ std::optional<std::string> RobloxTypeInferer::GlobalFunctionType(const std::stri
     if (name == "collectgarbage" || name == "gcinfo")
         return "number";
     if (name == "getfenv")
-        return "{ [any]: any }";
+        return "table";
     (void)args;
     return std::nullopt;
 }
@@ -364,29 +330,10 @@ std::optional<std::string> RobloxTypeInferer::ExpressionAutoName(const std::shar
                     return result;
         }
         if (auto globalId = std::dynamic_pointer_cast<IdentifierExpressionNode>(call->callee)) {
-            if (auto gname = IdentifierName(globalId)) {
-                // `require(path:WaitForChild("Module"))` is named after whatever the required
-                // path resolves to. The lifter already handles the common shape; recurse here so
-                // any required expression we can name (e.g. `require(Modules.Foo)`) is covered too.
-                if (*gname == "require" && !call->arguments.empty())
-                    if (auto inner = ExpressionAutoName(call->arguments[0]))
-                        return inner;
+            if (auto gname = IdentifierName(globalId))
                 if (auto result = GlobalFunctionAutoName(*gname, call->arguments))
                     return result;
-            }
         }
-    }
-
-    // A bare field read (`clone.PrimaryPart`, `weapon.Name`) names the local after the field.
-    // Bracket/dynamic indexing (`t[k]`) carries no usable name and is intentionally skipped.
-    if (auto member = std::dynamic_pointer_cast<MemberExpressionNode>(expr)) {
-        if (member->table)
-            if (auto field = StringLiteralValue(member->key)) {
-                if (auto table = IdentifierName(member->table); table == "script" && *field == "Parent")
-                    return "scriptParent";
-                if (auto name = ConventionalFieldName(*field))
-                    return name;
-            }
     }
 
     return std::nullopt;
@@ -420,8 +367,8 @@ std::string RobloxTypeInferer::ResolveAutoName(const std::string &currentName, c
 void RobloxTypeInferer::RenameIdentifier(const std::shared_ptr<Expression> &expr, const std::string &name) {
     if (auto id = std::dynamic_pointer_cast<IdentifierExpressionNode>(expr); id && id->identifier)
         id->identifier->name = name;
-    else if (auto id = std::dynamic_pointer_cast<Identifier>(expr))
-        id->name = name;
+    else if (auto identifier = std::dynamic_pointer_cast<Identifier>(expr))
+        identifier->name = name;
 }
 
 void RobloxTypeInferer::RegisterExistingNames(const std::vector<std::shared_ptr<Statement>> &stmts) {
@@ -480,12 +427,6 @@ void RobloxTypeInferer::Visit(IdentifierExpressionNode *lpNode) {
 }
 void RobloxTypeInferer::Visit(NilLiteralNode *lpNode) { (void)lpNode; }
 void RobloxTypeInferer::Visit(NoExpressionNode *lpNode) { (void)lpNode; }
-
-void RobloxTypeInferer::Visit(IfElseExpressionNode *lpNode) {
-    VisitNode(lpNode->condition);
-    VisitNode(lpNode->thenExpr);
-    VisitNode(lpNode->elseExpr);
-}
 void RobloxTypeInferer::Visit(VarArgExpression *lpNode) { (void)lpNode; }
 
 void RobloxTypeInferer::Visit(RootNode *lpNode) {

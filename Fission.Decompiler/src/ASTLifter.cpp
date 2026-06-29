@@ -7,9 +7,12 @@
 #include "AbstractSyntaxTree/Nodes/CommentNode.hpp"
 
 #include <algorithm>
-#include <functional>
 
+#if defined(__clang__)
 #pragma clang optimize off
+#endif
+
+constexpr uint32_t InvalidBlockId = static_cast<uint32_t>(-1);
 
 // Forward declaration for the chain-fold pass used by CreateBlock below.
 static void FoldShortCircuitChain(std::vector<std::shared_ptr<Statement>> &stmts);
@@ -583,19 +586,6 @@ static bool IsSingleUseCallArgument(AnalyzedFunction *func, int32_t reg, int32_t
     return true;
 }
 
-// A value that can never be nil/false, so `cond and value or other` is equivalent to
-// `if cond then value else other`. Used to keep the 2-way and/or fold sound (a clean value diamond
-// may originate from `if c then <falsy> else b`, where the and/or form would be wrong).
-static bool IsProvablyTruthy(const std::shared_ptr<Expression> &e) {
-    if (std::dynamic_pointer_cast<NumberLiteralNode>(e) || std::dynamic_pointer_cast<IntegerLiteralNode>(e) ||
-        std::dynamic_pointer_cast<StringLiteralNode>(e) || std::dynamic_pointer_cast<TableLiteralNode>(e) ||
-        std::dynamic_pointer_cast<VectorNode>(e) || std::dynamic_pointer_cast<FunctionDeclarationNode>(e))
-        return true;
-    if (auto b = std::dynamic_pointer_cast<BooleanLiteralNode>(e))
-        return b->value; // only `true`
-    return false; // nil, identifiers, calls, indexes, ... → unknown
-}
-
 // valid Luau ident (alnum + _, no leading digit). Roblox instance names may have spaces — reject those.
 static bool IsValidLuauIdent(const std::string &s) {
     if (s.empty() || std::isdigit(static_cast<unsigned char>(s[0])))
@@ -626,28 +616,6 @@ static bool IsSingleUseTableFieldValue(AnalyzedFunction *func, int32_t reg, int3
     }
     // must be the stored value (operand[0]), not the table (operand[1]).
     return user->operands[0].value.reg == reg && user->operands[1].value.reg != reg;
-}
-
-// single-use closure whose one user invokes it directly as the callee: an IIFE
-// `(function(...) ... end)(args)`. inline the literal at the call site instead of
-// hoisting a `local function anon_N(...) ... end` that is referenced exactly once.
-static bool IsSingleUseCallee(AnalyzedFunction *func, int32_t reg, int32_t ssaVersion) {
-    SSARef ref{static_cast<uint8_t>(reg), ssaVersion};
-    auto it = func->users.find(ref);
-    if (it == func->users.end() || it->second.size() != 1)
-        return false;
-    auto *user = it->second.front();
-    if (!user || user->operands.empty())
-        return false;
-    switch (user->operation) {
-    case LiftedOperation::CALL:
-    case LiftedOperation::CALLFB:
-        break;
-    default:
-        return false; // NAMECALL's base is the method receiver, never an invoked closure.
-    }
-    // the closure must sit in the callee slot (operand[0]), not be a passed argument.
-    return user->operands[0].value.reg == reg;
 }
 
 std::shared_ptr<Expression> ASTLifter::InvertCondition(const std::shared_ptr<Expression> &cond) {
@@ -797,7 +765,7 @@ ASTFunction ASTLifter::Lift(AnalyzedFunction &analyzedFunction) {
         }
 
         std::set<uint32_t> visited;
-        ast.statements = LiftControlFlow(0, -1, visited);
+        ast.statements = LiftControlFlow(0, InvalidBlockId, visited);
         std::string ttinfo = "Unavailable";
 
         if (analyzedFunction.lpLiftedFunction->lpDeserialized->typeinfo.size() != 0) {
@@ -843,8 +811,6 @@ ASTFunction ASTLifter::Lift(AnalyzedFunction &analyzedFunction) {
 
     for (auto &subFunc : analyzedFunction.innerFunctions) {
         ASTLifter subLifter;
-        subLifter.m_useIfElseExpressions = m_useIfElseExpressions;
-        subLifter.m_emitDebugInfo = m_emitDebugInfo;
         ast.subFunctions.push_back(subLifter.Lift(subFunc));
     }
 
@@ -922,6 +888,7 @@ std::shared_ptr<Expression> ASTLifter::LiftCondition(const LiftedInstruction *in
 
             return std::make_shared<BinaryExpressionNode>("==", LiftExpression(inst->operands[0]), rhs);
         }
+        return std::make_shared<BooleanLiteralNode>(false);
     }
     default:
         return std::make_shared<BooleanLiteralNode>(false);
@@ -953,7 +920,7 @@ std::vector<std::shared_ptr<Statement>> ASTLifter::LiftControlFlow(uint32_t curr
     // iterative tail-traversal: recursing the linear `after` continuation overflows the stack on long
     // `if .. return end; ...` chains. branch/loop bodies still recurse (bounded by nesting depth).
     while (true) {
-        if (currentBlockId == static_cast<uint32_t>(-1) || currentBlockId >= m_currentFunction->basicBlocks.size())
+        if (currentBlockId == InvalidBlockId || currentBlockId >= m_currentFunction->basicBlocks.size())
             break;
 
         // body code reaching the innermost loop exit directly == `break` (normal exit goes via latch).
@@ -979,7 +946,7 @@ std::vector<std::shared_ptr<Statement>> ASTLifter::LiftControlFlow(uint32_t curr
         auto stmts = LiftBlockInstructions(block);
 
         // Linear continuation for the next iteration; -1 terminates the loop.
-        uint32_t nextBlockId = static_cast<uint32_t>(-1);
+        uint32_t nextBlockId = InvalidBlockId;
 
         switch (block.bType) {
     case BlockType::IfHeader: {
@@ -989,25 +956,6 @@ std::vector<std::shared_ptr<Statement>> ASTLifter::LiftControlFlow(uint32_t curr
         if (auto mat = DetectBooleanMaterialization(currentBlockId)) {
             nodes.push_back(mat->assignment);
             nextBlockId = mat->continueBlock;
-            break;
-        }
-
-        // `x = a and P or b and Q or ... ` lowers to a chain of value diamonds sharing one merge;
-        // collapse it to the short-circuit expression before the 2-way / statement paths see it.
-        if (auto sc = DetectShortCircuitChain(currentBlockId)) {
-            nodes.push_back(sc->assignment);
-            for (uint32_t cb : sc->consumedBlocks)
-                visited.insert(cb);
-            nextBlockId = sc->continueBlock;
-            break;
-        }
-
-        // `x = if c then A else B` lowers to a value diamond, not a statement `if`; collapse it.
-        if (auto ie = DetectIfElseExpression(currentBlockId)) {
-            nodes.push_back(ie->assignment);
-            for (uint32_t cb : ie->consumedBlocks)
-                visited.insert(cb);
-            nextBlockId = ie->continueBlock;
             break;
         }
 
@@ -1030,7 +978,7 @@ std::vector<std::shared_ptr<Statement>> ASTLifter::LiftControlFlow(uint32_t curr
 
             uint32_t mergeIdx = FindMergeBlock(trueIdx, falseIdx);
 
-            if (mergeIdx == (uint32_t)-1) {
+            if (mergeIdx == InvalidBlockId) {
                 bool trueIsReturn = (m_currentFunction->basicBlocks[trueIdx].bType == BlockType::Return);
                 bool falseIsReturn = (m_currentFunction->basicBlocks[falseIdx].bType == BlockType::Return);
 
@@ -1043,7 +991,7 @@ std::vector<std::shared_ptr<Statement>> ASTLifter::LiftControlFlow(uint32_t curr
 
             auto ifStmt = std::make_shared<IfStatementNode>();
             auto visitedCopy = visited;
-            if (mergeIdx != (uint32_t)-1)
+            if (mergeIdx != InvalidBlockId)
                 visitedCopy.insert(mergeIdx);
 
             // snapshot regs declared BEFORE branches: HoistPhiLocals tests "already in outer scope?"
@@ -1064,7 +1012,7 @@ std::vector<std::shared_ptr<Statement>> ASTLifter::LiftControlFlow(uint32_t curr
                     uint32_t depth = 0;
                     uint32_t cur = startId;
                     std::set<uint32_t> seen;
-                    while (cur != static_cast<uint32_t>(-1) && cur < m_currentFunction->basicBlocks.size() && !seen.contains(cur)) {
+                    while (cur != InvalidBlockId && cur < m_currentFunction->basicBlocks.size() && !seen.contains(cur)) {
                         seen.insert(cur);
                         const auto &b = m_currentFunction->basicBlocks[cur];
                         if (b.bType != BlockType::IfHeader)
@@ -1074,7 +1022,7 @@ std::vector<std::shared_ptr<Statement>> ASTLifter::LiftControlFlow(uint32_t curr
                         uint32_t bt = b.ifStatementTrue.value();
                         uint32_t bf = b.ifStatementFalse.value();
                         uint32_t bm = FindMergeBlock(bt, bf);
-                        if (bm == static_cast<uint32_t>(-1)) {
+                        if (bm == InvalidBlockId) {
                             bool tR = (m_currentFunction->basicBlocks[bt].bType == BlockType::Return);
                             bool fR = (m_currentFunction->basicBlocks[bf].bType == BlockType::Return);
                             if (tR && !fR)
@@ -1098,7 +1046,7 @@ std::vector<std::shared_ptr<Statement>> ASTLifter::LiftControlFlow(uint32_t curr
                     uint32_t chainStopId = mergeIdx;
                     std::set<uint32_t> chainVisited = visitedCopy;
                     while (true) {
-                        if (chainBlockId == static_cast<uint32_t>(-1) || chainBlockId >= m_currentFunction->basicBlocks.size())
+                        if (chainBlockId == InvalidBlockId || chainBlockId >= m_currentFunction->basicBlocks.size())
                             break;
                         if (!m_loopExitStack.empty() && chainBlockId == m_loopExitStack.back())
                             break;
@@ -1118,7 +1066,7 @@ std::vector<std::shared_ptr<Statement>> ASTLifter::LiftControlFlow(uint32_t curr
                         uint32_t cTrueIdx = chainBlock.ifStatementTrue.value();
                         uint32_t cFalseIdx = chainBlock.ifStatementFalse.value();
                         uint32_t cMergeIdx = FindMergeBlock(cTrueIdx, cFalseIdx);
-                        if (cMergeIdx == (uint32_t)-1) {
+                        if (cMergeIdx == InvalidBlockId) {
                             bool t = (m_currentFunction->basicBlocks[cTrueIdx].bType == BlockType::Return);
                             bool f = (m_currentFunction->basicBlocks[cFalseIdx].bType == BlockType::Return);
                             if (t && !f)
@@ -1170,7 +1118,7 @@ std::vector<std::shared_ptr<Statement>> ASTLifter::LiftControlFlow(uint32_t curr
             // don't fall through into the loop exit here (would inline post-loop code / emit a stray
             // break); it's the break target and is lifted once after the loop.
             const bool mergeIsLoopExit = !m_loopExitStack.empty() && mergeIdx == m_loopExitStack.back();
-            if (mergeIdx != (uint32_t)-1 && !mergeIsLoopExit)
+            if (mergeIdx != InvalidBlockId && !mergeIsLoopExit)
                 nextBlockId = mergeIdx;
 
         } else {
@@ -1223,7 +1171,7 @@ std::vector<std::shared_ptr<Statement>> ASTLifter::LiftControlFlow(uint32_t curr
                 } else {
                     // Pattern 2: latch is plain JUMP back to header. exit cond is in the header
                     // or decomposed into trailing if-return blocks (`until a or b`); lift body then scan.
-                    uint32_t bodyStart = static_cast<uint32_t>(-1);
+                    uint32_t bodyStart = InvalidBlockId;
                     for (auto s : block.successors) {
                         if (s != exitIdx) {
                             bodyStart = s;
@@ -1236,7 +1184,7 @@ std::vector<std::shared_ptr<Statement>> ASTLifter::LiftControlFlow(uint32_t curr
                     bodyVisited.insert(exitIdx);
 
                     std::vector<std::shared_ptr<Statement>> bodyStmts;
-                    if (bodyStart != static_cast<uint32_t>(-1)) {
+                    if (bodyStart != InvalidBlockId) {
                         bodyStmts = LiftControlFlow(bodyStart, latchIdx, bodyVisited);
                     }
 
@@ -1280,14 +1228,14 @@ std::vector<std::shared_ptr<Statement>> ASTLifter::LiftControlFlow(uint32_t curr
                 }
                 nodes.push_back(repeatNode);
             } else if ((block.dwBlockFlags & LoopBlockFlags::ForNumericLoop) == LoopBlockFlags::ForNumericLoop) {
-                uint32_t bodyIdx = -1;
+                uint32_t bodyIdx = InvalidBlockId;
                 for (auto succ : block.successors) {
-                    if (succ != block.loopLatch.value_or(-1)) {
+                    if (succ != block.loopLatch.value_or(InvalidBlockId)) {
                         bodyIdx = succ;
                         break;
                     }
                 }
-                if (block.loopExit.has_value() && block.loopExit.value() != bodyIdx && block.loopExit.value() != block.loopLatch.value_or(-1))
+                if (block.loopExit.has_value() && block.loopExit.value() != bodyIdx && block.loopExit.value() != block.loopLatch.value_or(InvalidBlockId))
                     exitIdx = block.loopExit.value();
                 else if (block.loopLatch.has_value()) {
                     for (auto succ : m_currentFunction->basicBlocks[*block.loopLatch].successors) {
@@ -1323,7 +1271,7 @@ std::vector<std::shared_ptr<Statement>> ASTLifter::LiftControlFlow(uint32_t curr
                         this->m_currentFunction->SetVariableName(baseReg + 2, startVer, loopVarName);
                         // expose this loop's exit so body branches to it become `break` (real exit only).
                         const bool hasBreakTarget =
-                            (exitIdx != static_cast<uint32_t>(-1) && exitIdx != latchIdx && exitIdx != bodyIdx);
+                            (exitIdx != InvalidBlockId && exitIdx != latchIdx && exitIdx != bodyIdx);
                         if (hasBreakTarget)
                             m_loopExitStack.push_back(exitIdx);
                         forNode->lpLoopBody = CreateBlock(LiftControlFlow(
@@ -1419,7 +1367,7 @@ std::vector<std::shared_ptr<Statement>> ASTLifter::LiftControlFlow(uint32_t curr
                 if (block.loopExit.has_value())
                     exitIdx = block.loopExit.value();
 
-                uint32_t bodyStart = -1;
+                uint32_t bodyStart = InvalidBlockId;
                 for (auto s : block.successors)
                     if (s != exitIdx)
                         bodyStart = s;
@@ -1436,11 +1384,11 @@ std::vector<std::shared_ptr<Statement>> ASTLifter::LiftControlFlow(uint32_t curr
                 else
                     whileNode->condition = InvertCondition(LiftCondition(block.lpTail));
 
-                if (bodyStart != static_cast<uint32_t>(-1)) {
+                if (bodyStart != InvalidBlockId) {
                     std::set<uint32_t> cloopVisited = visited;
                     cloopVisited.insert(latchIdx);
                     cloopVisited.insert(exitIdx);
-                    const bool hasBreakTarget = (exitIdx != static_cast<uint32_t>(-1) && exitIdx != latchIdx && exitIdx != bodyStart);
+                    const bool hasBreakTarget = (exitIdx != InvalidBlockId && exitIdx != latchIdx && exitIdx != bodyStart);
                     if (hasBreakTarget)
                         m_loopExitStack.push_back(exitIdx);
                     auto bodyStmts = LiftControlFlow(bodyStart, latchIdx, cloopVisited);
@@ -1470,14 +1418,14 @@ std::vector<std::shared_ptr<Statement>> ASTLifter::LiftControlFlow(uint32_t curr
                 (block.dwBlockFlags & LoopBlockFlags::ForGeneralLoop_Pairs) == LoopBlockFlags::ForGeneralLoop_Pairs ||
                 (block.dwBlockFlags & LoopBlockFlags::ForGeneralLoop_Indexed) == LoopBlockFlags::ForGeneralLoop_Indexed
             ) {
-                uint32_t bodyIdx = -1;
+                uint32_t bodyIdx = InvalidBlockId;
                 for (auto succ : block.successors) {
-                    if (succ != block.loopLatch.value_or(-1)) {
+                    if (succ != block.loopLatch.value_or(InvalidBlockId)) {
                         bodyIdx = succ;
                         break;
                     }
                 }
-                if (block.loopExit.has_value() && block.loopExit.value() != bodyIdx && block.loopExit.value() != block.loopLatch.value_or(-1))
+                if (block.loopExit.has_value() && block.loopExit.value() != bodyIdx && block.loopExit.value() != block.loopLatch.value_or(InvalidBlockId))
                     exitIdx = block.loopExit.value();
                 else if (block.loopLatch.has_value()) {
                     for (auto succ : m_currentFunction->basicBlocks[*block.loopLatch].successors) {
@@ -1507,7 +1455,7 @@ std::vector<std::shared_ptr<Statement>> ASTLifter::LiftControlFlow(uint32_t curr
                     }
 
                     const bool hasBreakTarget =
-                        (exitIdx != static_cast<uint32_t>(-1) && exitIdx != block.loopLatch.value_or(-1) && exitIdx != bodyIdx);
+                        (exitIdx != InvalidBlockId && exitIdx != block.loopLatch.value_or(InvalidBlockId) && exitIdx != bodyIdx);
                     if (hasBreakTarget)
                         m_loopExitStack.push_back(exitIdx);
                     forNode->body = CreateBlock(LiftControlFlow(bodyIdx, *block.loopLatch, loopVisited));
@@ -1581,7 +1529,7 @@ std::vector<std::shared_ptr<Statement>> ASTLifter::LiftControlFlow(uint32_t curr
             whileNode->condition = std::make_shared<BooleanLiteralNode>(true);
             whileNode->body = CreateBlock(loopBody);
             nodes.push_back(whileNode);
-            nextBlockId = static_cast<uint32_t>(-1); // infinite loop: nothing after the back-edge is reachable.
+            nextBlockId = InvalidBlockId; // infinite loop: nothing after the back-edge is reachable.
         }
         break;
     }
@@ -1612,7 +1560,7 @@ std::vector<std::shared_ptr<Statement>> ASTLifter::LiftControlFlow(uint32_t curr
     }
     }
 
-        if (nextBlockId == static_cast<uint32_t>(-1))
+        if (nextBlockId == InvalidBlockId)
             break;
         currentBlockId = nextBlockId;
     }
@@ -1626,10 +1574,6 @@ std::vector<std::shared_ptr<Statement>> ASTLifter::LiftControlFlow(uint32_t curr
 
 std::vector<std::shared_ptr<Statement>> ASTLifter::LiftBlockInstructions(const BasicBlock &block, bool forceDefinitions) {
     std::vector<std::shared_ptr<Statement>> statements;
-    // {source instruction, statements.size() before that instruction was lifted}. Recorded at the top of
-    // each processed instruction so each produced statement can be mapped back to its instruction for
-    // DebugInfo annotation. Robust to inner break/continue since it is recorded before the switch.
-    std::vector<std::pair<int, size_t>> stmtMarks;
     if (!block.lpHead)
         return statements;
 
@@ -1641,8 +1585,6 @@ std::vector<std::shared_ptr<Statement>> ASTLifter::LiftBlockInstructions(const B
 
         if (!forceDefinitions && ShouldInline(&inst))
             continue;
-
-        stmtMarks.push_back({i, statements.size()});
 
         switch (inst.operation) {
         case LiftedOperation::GETVARARGS: {
@@ -1883,8 +1825,6 @@ std::vector<std::shared_ptr<Statement>> ASTLifter::LiftBlockInstructions(const B
             }
 
             ASTLifter subLifter;
-            subLifter.m_useIfElseExpressions = m_useIfElseExpressions;
-            subLifter.m_emitDebugInfo = m_emitDebugInfo;
             ASTFunction subAst = subLifter.Lift(*targetFunc);
 
             std::string funcName = this->GetFunctionName(duplicatedFunction);
@@ -1923,11 +1863,10 @@ std::vector<std::shared_ptr<Statement>> ASTLifter::LiftBlockInstructions(const B
 
             auto &saveWhere = inst.operands[0];
 
-            // If the closure has a single use that is a call argument, an IIFE
-            // callee, or a table-field value, park it in the inline-substitution
-            // map and skip emitting a top-level `local function name(...) ... end`.
+            // If the closure has a single use that is a call argument, park
+            // it in the inline-substitution map and skip emitting a top-level
+            // `local function name(...) ... end` declaration entirely.
             if (IsSingleUseCallArgument(m_currentFunction, saveWhere.value.reg, saveWhere.ssaVersion) ||
-                IsSingleUseCallee(m_currentFunction, saveWhere.value.reg, saveWhere.ssaVersion) ||
                 IsSingleUseTableFieldValue(m_currentFunction, saveWhere.value.reg, saveWhere.ssaVersion)) {
                 fnDecl->bAnonymousInline = true;
                 fnDecl->bIsLocalDeclaration = false;
@@ -2068,8 +2007,6 @@ std::vector<std::shared_ptr<Statement>> ASTLifter::LiftBlockInstructions(const B
             }
 
             ASTLifter subLifter;
-            subLifter.m_useIfElseExpressions = m_useIfElseExpressions;
-            subLifter.m_emitDebugInfo = m_emitDebugInfo;
             ASTFunction subAst = subLifter.Lift(*targetFunc);
 
             std::string funcName = this->GetFunctionName(proto);
@@ -2101,10 +2038,9 @@ std::vector<std::shared_ptr<Statement>> ASTLifter::LiftBlockInstructions(const B
 
             auto &saveWhere = inst.operands[0];
 
-            // See DUPCLOSURE: single-use call-arg / IIFE-callee / table-field closures
-            // collapse to an inline `function(...) ... end` substituted at the use site.
+            // See DUPCLOSURE: single-use call-arg / table-field closures collapse
+            // to an inline `function(...) ... end` substituted at the use site.
             if (IsSingleUseCallArgument(m_currentFunction, saveWhere.value.reg, saveWhere.ssaVersion) ||
-                IsSingleUseCallee(m_currentFunction, saveWhere.value.reg, saveWhere.ssaVersion) ||
                 IsSingleUseTableFieldValue(m_currentFunction, saveWhere.value.reg, saveWhere.ssaVersion)) {
                 fnDecl->bAnonymousInline = true;
                 fnDecl->bIsLocalDeclaration = false;
@@ -2231,97 +2167,7 @@ std::vector<std::shared_ptr<Statement>> ASTLifter::LiftBlockInstructions(const B
         }
         }
     }
-
-    if (m_emitDebugInfo && block.lpHead) {
-        const int lo = block.lpHead->instructionIndex;
-        auto &instrs = m_currentFunction->lpLiftedFunction->instructions;
-        auto instrForStmt = [&](size_t k) -> int {
-            int instr = -1;
-            for (const auto &m : stmtMarks) {
-                if (m.second <= k)
-                    instr = m.first;
-                else
-                    break;
-            }
-            return instr;
-        };
-        // The span of registers a statement touches: min..max over the register operands of every
-        // instruction that produced it (the defining instruction plus the inlined temps before it).
-        int prevInstr = lo - 1;
-        for (size_t k = 0; k < statements.size(); ++k) {
-            const int instr = instrForStmt(k);
-            if (instr < 0 || instr >= static_cast<int>(instrs.size()))
-                continue;
-            int start = std::max(prevInstr + 1, lo);
-            const int end = instr;
-            prevInstr = instr;
-            if (start > end)
-                start = end;
-
-            int minReg = 1 << 30, maxReg = -1;
-            for (int i = start; i <= end && i < static_cast<int>(instrs.size()); ++i)
-                for (const auto &op : instrs[i].operands)
-                    if (op.type == LiftedOperandType::Register) {
-                        minReg = std::min(minReg, static_cast<int>(op.value.reg));
-                        maxReg = std::max(maxReg, static_cast<int>(op.value.reg));
-                    }
-            TagDebugAnnotation(statements[k], instr, minReg, maxReg, OperationToString(instrs[instr].operation));
-        }
-    }
-
-    auto grouped = std::move(statements);
-
-    // DebugInfo: bracket the block's lifted statements with its basic-block id so the decompiled
-    // output maps back to the IR. Marks the BB boundary.
-    if (m_emitDebugInfo && !grouped.empty()) {
-        std::vector<std::shared_ptr<Statement>> wrapped;
-        wrapped.reserve(grouped.size() + 2);
-        wrapped.push_back(std::make_shared<CommentNode>(std::format("BLOCK_{} start", block.dwBlockId), true, false));
-        for (auto &s : grouped)
-            wrapped.push_back(std::move(s));
-        wrapped.push_back(std::make_shared<CommentNode>(std::format("BLOCK_{} end", block.dwBlockId), true, false));
-        return wrapped;
-    }
-
-    return grouped;
-}
-
-int ASTLifter::LineForPc(int pc) {
-    // The cached des->abslineinfo raw pointer dangles after the function is copied; recompute it from
-    // the live lineinfo buffer. Lifted instructionIndex == bytecode PC (one lifted entry per word).
-    auto *des = m_currentFunction->lpLiftedFunction->lpDeserialized;
-    const int count = static_cast<int>(des->instructions.size());
-    if (des->lineinfo.empty() || pc < 0 || pc >= count)
-        return -1;
-    const int absoffset = (count + 3) & ~3;
-    if (absoffset < 0 || static_cast<size_t>(absoffset) + sizeof(int) > des->lineinfo.size())
-        return -1;
-    const auto *absline = reinterpret_cast<const int *>(des->lineinfo.data() + absoffset);
-    return absline[pc >> des->linegaplog2] + des->lineinfo[pc];
-}
-
-std::pair<int, int> ASTLifter::RegisterSpanOfBlocks(const std::vector<uint32_t> &blockIds) {
-    int minReg = 1 << 30, maxReg = -1;
-    const auto &blocks = m_currentFunction->basicBlocks;
-    auto &instrs = m_currentFunction->lpLiftedFunction->instructions;
-    for (uint32_t bid : blockIds) {
-        if (bid >= blocks.size() || !blocks[bid].lpHead || !blocks[bid].lpTail)
-            continue;
-        for (int i = blocks[bid].lpHead->instructionIndex; i <= blocks[bid].lpTail->instructionIndex && i < static_cast<int>(instrs.size()); ++i)
-            for (const auto &op : instrs[i].operands)
-                if (op.type == LiftedOperandType::Register) {
-                    minReg = std::min(minReg, static_cast<int>(op.value.reg));
-                    maxReg = std::max(maxReg, static_cast<int>(op.value.reg));
-                }
-    }
-    return {minReg, maxReg};
-}
-
-void ASTLifter::TagDebugAnnotation(const std::shared_ptr<Statement> &stmt, int lineInstr, int minReg, int maxReg, std::string_view op) {
-    if (!m_emitDebugInfo || !stmt)
-        return;
-    const std::string regStr = (maxReg < 0) ? "-" : std::format("R{}-R{}", minReg, maxReg);
-    stmt->debugAnnotation = std::format("Line: {}, Register: {}, OpCode: {}", LineForPc(lineInstr), regStr, op);
+    return statements;
 }
 
 bool ASTLifter::CanReach(uint32_t start, uint32_t target, uint32_t stopBlock, const std::set<uint32_t> &visitedScopes) {
@@ -3327,351 +3173,7 @@ std::optional<ASTLifter::BoolMaterialization> ASTLifter::DetectBooleanMaterializ
     m_processedInstructions.insert(fLoad->instructionIndex);
     m_processedInstructions.insert(tLoad->instructionIndex);
 
-    if (m_emitDebugInfo && H.lpTail) {
-        auto [mn, mx] = RegisterSpanOfBlocks({headerId, fIdx, tIdx});
-        TagDebugAnnotation(assignment, H.lpTail->instructionIndex, mn, mx, OperationToString(H.lpTail->operation));
-    }
-
     return BoolMaterialization{assignment, tIdx};
-}
-
-std::optional<ASTLifter::IfElseMaterialization> ASTLifter::DetectIfElseExpression(uint32_t headerId) {
-    const auto &blocks = m_currentFunction->basicBlocks;
-    if (headerId >= blocks.size())
-        return std::nullopt;
-    const auto &H = blocks[headerId];
-    if (!H.ifStatementTrue.has_value() || !H.ifStatementFalse.has_value() || !H.lpTail)
-        return std::nullopt;
-
-    const uint32_t tIdx = *H.ifStatementTrue;  // reached when the lifted condition is true
-    const uint32_t fIdx = *H.ifStatementFalse; // reached when it is false
-    if (tIdx >= blocks.size() || fIdx >= blocks.size())
-        return std::nullopt;
-
-    auto realInstrs = [&](const BasicBlock &blk) -> std::vector<const LiftedInstruction *> {
-        std::vector<const LiftedInstruction *> v;
-        if (!blk.lpHead || !blk.lpTail)
-            return v;
-        for (int i = blk.lpHead->instructionIndex; i <= blk.lpTail->instructionIndex; ++i) {
-            const auto &ins = m_currentFunction->lpLiftedFunction->instructions[i];
-            if (ins.operation != LiftedOperation::NOP)
-                v.push_back(&ins);
-        }
-        return v;
-    };
-    auto isJumpOnly = [&](uint32_t bid) -> bool {
-        if (bid >= blocks.size())
-            return false;
-        auto ins = realInstrs(blocks[bid]);
-        return ins.size() == 1 && ins[0]->operation == LiftedOperation::JUMP && blocks[bid].successors.size() == 1;
-    };
-
-    // A branch must assign one register exactly once (a single value-producing instruction) and then
-    // flow — possibly through a jump-only block — to a merge. Returns the register, its value, the
-    // merge block, and the blocks consumed.
-    struct BranchVal {
-        int reg;
-        std::shared_ptr<Expression> value;
-        uint32_t merge;
-        std::vector<uint32_t> blocks;
-    };
-    auto resolveBranch = [&](uint32_t bid) -> std::optional<BranchVal> {
-        if (bid >= blocks.size())
-            return std::nullopt;
-        const auto &b = blocks[bid];
-        auto ins = realInstrs(b);
-        if (ins.size() != 1)
-            return std::nullopt;
-        const LiftedInstruction *def = ins[0];
-        if (def->operands.empty() || def->operands[0].type != LiftedOperandType::Register)
-            return std::nullopt;
-        if (m_currentFunction->GetDefinition(def->operands[0]) != def)
-            return std::nullopt; // operand[0] must be this instruction's own def (a value write).
-        if (b.successors.size() != 1)
-            return std::nullopt;
-        BranchVal bv;
-        bv.reg = def->operands[0].value.reg;
-        bv.value = LiftExpression(def->operands[0], true);
-        bv.blocks.push_back(bid);
-        uint32_t nxt = b.successors[0];
-        if (isJumpOnly(nxt)) {
-            bv.blocks.push_back(nxt);
-            nxt = blocks[nxt].successors[0];
-        }
-        bv.merge = nxt;
-        return bv;
-    };
-
-    auto bt = resolveBranch(tIdx);
-    auto bf = resolveBranch(fIdx);
-    if (!bt || !bf)
-        return std::nullopt;
-    if (bt->reg != bf->reg || bt->merge != bf->merge)
-        return std::nullopt;
-    const uint32_t mergeId = bt->merge;
-    if (mergeId >= blocks.size())
-        return std::nullopt;
-
-    // The merge must be entered only from the two branch tails, so `reg` is provably the diamond's
-    // value and the branches have no other effect.
-    const uint32_t tailT = bt->blocks.back();
-    const uint32_t tailF = bf->blocks.back();
-    if (std::set<uint32_t>(blocks[mergeId].predecessors.begin(), blocks[mergeId].predecessors.end()) != std::set<uint32_t>{tailT, tailF})
-        return std::nullopt;
-
-    // Only collapse genuine condition jumps.
-    auto cond = LiftCondition(H.lpTail);
-    if (!cond || std::dynamic_pointer_cast<BooleanLiteralNode>(cond))
-        return std::nullopt;
-
-    std::shared_ptr<Expression> thenV = bt->value; // condition true → tIdx
-    std::shared_ptr<Expression> elseV = bf->value; // condition false → fIdx
-    // `if not X then A else B` reads cleaner as `if X then B else A`.
-    if (auto un = std::dynamic_pointer_cast<UnaryExpressionNode>(cond); un && un->op == "not ") {
-        cond = un->operand;
-        std::swap(thenV, elseV);
-    }
-
-    // Default: short-circuit `cond and A or B` (only when A can't be nil/false, else the and/or form
-    // would silently change behaviour). With UseIfElseExpressions, emit the `if cond then A else B`
-    // expression form instead.
-    std::shared_ptr<Expression> value;
-    if (!m_useIfElseExpressions && IsProvablyTruthy(thenV)) {
-        auto andExpr = std::make_shared<BinaryExpressionNode>("and", cond, thenV);
-        value = std::make_shared<BinaryExpressionNode>("or", andExpr, elseV);
-    } else {
-        value = std::make_shared<IfElseExpressionNode>(cond, thenV, elseV);
-    }
-
-    const uint8_t reg = static_cast<uint8_t>(bt->reg);
-    const LiftedOperand target = blocks[tIdx].lpHead ? realInstrs(blocks[tIdx])[0]->operands[0] : H.lpTail->operands[0];
-    const bool isDefined = m_definedRegisters.contains(reg);
-    const bool isParameter = reg < m_currentFunction->lpLiftedFunction->lpDeserialized->numparams;
-    auto ident = std::make_shared<IdentifierExpressionNode>(std::make_shared<Identifier>(ResolveVariableName(target)));
-
-    std::shared_ptr<Statement> assignment;
-    if ((target.ssaVersion <= 1 && !isParameter) || !isDefined)
-        assignment = std::make_shared<VariableDeclarationNode>(ident, value);
-    else
-        assignment = std::make_shared<AssignmentStatementNode>(ident, value);
-    m_definedRegisters.insert(reg);
-
-    std::vector<uint32_t> consumed;
-    consumed.insert(consumed.end(), bt->blocks.begin(), bt->blocks.end());
-    consumed.insert(consumed.end(), bf->blocks.begin(), bf->blocks.end());
-    // Consume the branch instructions so they are not re-emitted at the merge.
-    for (uint32_t cb : consumed)
-        if (cb < blocks.size() && blocks[cb].lpHead && blocks[cb].lpTail)
-            for (int i = blocks[cb].lpHead->instructionIndex; i <= blocks[cb].lpTail->instructionIndex; ++i)
-                m_processedInstructions.insert(i);
-
-    if (m_emitDebugInfo) {
-        std::vector<uint32_t> spanBlocks = consumed;
-        spanBlocks.push_back(headerId);
-        auto [mn, mx] = RegisterSpanOfBlocks(spanBlocks);
-        TagDebugAnnotation(assignment, H.lpTail->instructionIndex, mn, mx, OperationToString(H.lpTail->operation));
-    }
-
-    return IfElseMaterialization{assignment, mergeId, consumed};
-}
-
-std::optional<ASTLifter::IfElseMaterialization> ASTLifter::DetectShortCircuitChain(uint32_t headerId) {
-    const auto &blocks = m_currentFunction->basicBlocks;
-    if (headerId >= blocks.size())
-        return std::nullopt;
-    if (blocks[headerId].bType != BlockType::IfHeader)
-        return std::nullopt;
-
-    auto realInstrs = [&](const BasicBlock &blk) -> std::vector<const LiftedInstruction *> {
-        std::vector<const LiftedInstruction *> v;
-        if (!blk.lpHead || !blk.lpTail)
-            return v;
-        for (int i = blk.lpHead->instructionIndex; i <= blk.lpTail->instructionIndex; ++i) {
-            const auto &ins = m_currentFunction->lpLiftedFunction->instructions[i];
-            if (ins.operation != LiftedOperation::NOP)
-                v.push_back(&ins);
-        }
-        return v;
-    };
-    auto isJumpOnly = [&](uint32_t bid) -> bool {
-        if (bid >= blocks.size())
-            return false;
-        auto ins = realInstrs(blocks[bid]);
-        return ins.size() == 1 && ins[0]->operation == LiftedOperation::JUMP && blocks[bid].successors.size() == 1;
-    };
-
-    // recognised conditional-jump terminators (the ops LiftCondition turns into a real condition).
-    auto isConditionalJump = [](LiftedOperation op) -> bool {
-        switch (op) {
-        case LiftedOperation::JUMPIF:
-        case LiftedOperation::JUMPIFNOT:
-        case LiftedOperation::JUMPIFEQ:
-        case LiftedOperation::JUMPIFNOTEQ:
-        case LiftedOperation::JUMPIFLT:
-        case LiftedOperation::JUMPIFNOTLT:
-        case LiftedOperation::JUMPIFLE:
-        case LiftedOperation::JUMPIFNOTLE:
-            return true;
-        default:
-            return false;
-        }
-    };
-
-    // A leaf/header node in the value-materialisation tree. Phase 1 builds this structurally with NO
-    // lifting, so a non-match can bail without side effects (speculative LiftExpression/LiftCondition
-    // corrupt the normal lifting path that ShortCircuitFolder later relies on). Phase 2 lifts.
-    struct ScNode {
-        bool leaf = false;
-        const LiftedInstruction *def = nullptr;  // leaf: the value-writing instruction
-        const LiftedInstruction *term = nullptr; // header: the conditional terminator
-        std::shared_ptr<ScNode> thenChild, elseChild;
-    };
-
-    int rd = -1;
-    uint32_t mergeId = static_cast<uint32_t>(-1);
-    int leafCount = 0;
-    bool ok = true;
-    std::vector<uint32_t> consumed;
-    std::vector<const LiftedInstruction *> valueLoads;
-    std::set<int> condRegs;
-
-    // ---- Phase 1: structural validation only ----
-    std::function<std::shared_ptr<ScNode>(uint32_t)> validate = [&](uint32_t bid) -> std::shared_ptr<ScNode> {
-        if (!ok || bid >= blocks.size()) {
-            ok = false;
-            return nullptr;
-        }
-        const auto &b = blocks[bid];
-
-        if (b.bType == BlockType::IfHeader) {
-            if (!b.ifStatementTrue.has_value() || !b.ifStatementFalse.has_value() || !b.lpTail || !isConditionalJump(b.lpTail->operation)) {
-                ok = false;
-                return nullptr;
-            }
-            for (const auto &op : b.lpTail->operands)
-                if (op.type == LiftedOperandType::Register)
-                    condRegs.insert(op.value.reg);
-            auto node = std::make_shared<ScNode>();
-            node->term = b.lpTail;
-            node->thenChild = validate(*b.ifStatementFalse); // fall-through = condition truthy = `and` value
-            node->elseChild = validate(*b.ifStatementTrue);  // jump-target = condition falsy = `or` continuation
-            if (!ok || !node->thenChild || !node->elseChild)
-                return nullptr;
-            consumed.push_back(bid);
-            return node;
-        }
-
-        // leaf: exactly one real instruction that writes a register, then reaches the merge.
-        auto ins = realInstrs(b);
-        if (ins.size() != 1) {
-            ok = false;
-            return nullptr;
-        }
-        const LiftedInstruction *def = ins[0];
-        if (def->operands.empty() || def->operands[0].type != LiftedOperandType::Register || m_currentFunction->GetDefinition(def->operands[0]) != def) {
-            ok = false;
-            return nullptr;
-        }
-        const int reg = def->operands[0].value.reg;
-        if (rd == -1)
-            rd = reg;
-        else if (rd != reg) {
-            ok = false;
-            return nullptr;
-        }
-        if (b.successors.size() != 1) {
-            ok = false;
-            return nullptr;
-        }
-        uint32_t nxt = b.successors[0];
-        consumed.push_back(bid);
-        if (isJumpOnly(nxt)) {
-            consumed.push_back(nxt);
-            nxt = blocks[nxt].successors[0];
-        }
-        if (mergeId == static_cast<uint32_t>(-1))
-            mergeId = nxt;
-        else if (mergeId != nxt) {
-            ok = false;
-            return nullptr;
-        }
-        valueLoads.push_back(def);
-        ++leafCount;
-        auto node = std::make_shared<ScNode>();
-        node->leaf = true;
-        node->def = def;
-        return node;
-    };
-
-    auto tree = validate(headerId);
-    if (!ok || !tree || rd < 0 || mergeId == static_cast<uint32_t>(-1) || mergeId >= blocks.size())
-        return std::nullopt;
-    if (leafCount < 3)
-        return std::nullopt; // 2-way diamonds are handled (as `if cond then A else B`) by DetectIfElseExpression.
-
-    // A header that tests the materialised register itself is the `... or F` recheck of a
-    // possibly-falsy term (`local v = a and b or c`): leave that to the ShortCircuitFolder post-pass.
-    if (condRegs.count(rd))
-        return std::nullopt;
-
-    // If the register already had a value before the chain (an initialised local reassigned across
-    // branches, e.g. `local mode = 0; if x==1 then mode=10 elseif ...`), keep the readable
-    // if/elseif form instead of rewriting it into a short-circuit expression.
-    int minLeafInstr = valueLoads.front()->instructionIndex;
-    for (const auto *vl : valueLoads)
-        minLeafInstr = std::min(minLeafInstr, vl->instructionIndex);
-    for (const auto &[ref, defInst] : m_currentFunction->definitionMap)
-        if (defInst && ref.regIndex == rd && defInst->operation != LiftedOperation::PHI && defInst->instructionIndex < minLeafInstr)
-            return std::nullopt; // a real (non-phi) prior write means an initialised/reassigned local.
-
-    // The merge must be entered only from the chain's leaf tails — nothing else may flow in, or the
-    // register is not provably just this expression.
-    std::set<uint32_t> tails;
-    for (uint32_t cb : consumed)
-        if (cb < blocks.size() && blocks[cb].successors.size() == 1 && blocks[cb].successors[0] == mergeId)
-            tails.insert(cb);
-    if (std::set<uint32_t>(blocks[mergeId].predecessors.begin(), blocks[mergeId].predecessors.end()) != tails)
-        return std::nullopt;
-
-    // ---- Phase 2: lift the validated tree into the short-circuit expression (commit point) ----
-    std::function<std::shared_ptr<Expression>(const ScNode *)> emit = [&](const ScNode *n) -> std::shared_ptr<Expression> {
-        if (n->leaf)
-            return LiftExpression(n->def->operands[0], true);
-        auto cond = InvertCondition(LiftCondition(n->term));
-        if (m_useIfElseExpressions) // `if c then <then> elseif ... else <else>` (nested if-else expression)
-            return std::make_shared<IfElseExpressionNode>(cond, emit(n->thenChild.get()), emit(n->elseChild.get()));
-        auto andExpr = std::make_shared<BinaryExpressionNode>("and", cond, emit(n->thenChild.get()));
-        return std::make_shared<BinaryExpressionNode>("or", andExpr, emit(n->elseChild.get()));
-    };
-    auto expr = emit(tree.get());
-
-    const uint8_t reg = static_cast<uint8_t>(rd);
-    const LiftedOperand targetOp = valueLoads.front()->operands[0];
-    const bool isDefined = m_definedRegisters.contains(reg);
-    const bool isParameter = reg < m_currentFunction->lpLiftedFunction->lpDeserialized->numparams;
-    auto ident = std::make_shared<IdentifierExpressionNode>(std::make_shared<Identifier>(ResolveVariableName(targetOp)));
-
-    std::shared_ptr<Statement> assignment;
-    if ((targetOp.ssaVersion <= 1 && !isParameter) || !isDefined)
-        assignment = std::make_shared<VariableDeclarationNode>(ident, expr);
-    else
-        assignment = std::make_shared<AssignmentStatementNode>(ident, expr);
-    m_definedRegisters.insert(reg);
-
-    // Consume the branch instructions so they are not re-emitted at the merge.
-    for (uint32_t cb : consumed)
-        if (cb < blocks.size() && blocks[cb].lpHead && blocks[cb].lpTail)
-            for (int i = blocks[cb].lpHead->instructionIndex; i <= blocks[cb].lpTail->instructionIndex; ++i)
-                m_processedInstructions.insert(i);
-
-    if (m_emitDebugInfo && blocks[headerId].lpTail) {
-        std::vector<uint32_t> spanBlocks = consumed;
-        spanBlocks.push_back(headerId);
-        auto [mn, mx] = RegisterSpanOfBlocks(spanBlocks);
-        TagDebugAnnotation(assignment, blocks[headerId].lpTail->instructionIndex, mn, mx, OperationToString(blocks[headerId].lpTail->operation));
-    }
-
-    return IfElseMaterialization{assignment, mergeId, consumed};
 }
 
 void ASTLifter::HoistPhiLocals(int32_t mergeIdx, const std::shared_ptr<IfStatementNode> &ifStmt,
@@ -3869,7 +3371,7 @@ std::optional<ASTLifter::OrChainInfo> ASTLifter::DetectOrChain(uint32_t headerId
     std::vector<Link> links;
     std::set<uint32_t> guard;
     uint32_t cur = headerId;
-    uint32_t elseIdx = static_cast<uint32_t>(-1);
+    uint32_t elseIdx = InvalidBlockId;
     bool invertedFinal = false;
 
     while (cur < blocks.size() && !guard.contains(cur)) {
@@ -3903,7 +3405,7 @@ std::optional<ASTLifter::OrChainInfo> ASTLifter::DetectOrChain(uint32_t headerId
         break; // does not share the body → end of (non-)chain
     }
 
-    if (!invertedFinal || links.size() < 2 || elseIdx == static_cast<uint32_t>(-1))
+    if (!invertedFinal || links.size() < 2 || elseIdx == InvalidBlockId)
         return std::nullopt;
 
     // Structure confirmed. Lift each link's condition (the condition under which it
